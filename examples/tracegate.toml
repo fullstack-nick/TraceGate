@@ -43,3 +43,48 @@ capture_policy = "errors_and_slow"
 slow_threshold_ms = 500
 capture_request_body = true
 capture_response_body_bytes = 4096
+
+[[routes]]
+id = "plugin-timeout"
+hosts = ["*"]
+path_prefix = "/api/plugin-timeout"
+upstreams = ["http://payments-service:4000"]
+timeout_ms = 3000
+retries = 0
+capture_policy = "off"
+
+[[plugins]]
+id = "api-key-guard"
+path = "/usr/local/share/tracegate/plugins/api-key-guard.wasm"
+hook = "before_request"
+routes = ["payments"]
+timeout_ms = 50
+memory_limit_bytes = 16777216
+fuel = 10000000
+body_preview_bytes = 0
+raw_headers = ["x-api-key"]
+config = { header = "x-api-key", expected = "tracegate-demo-key", message = "missing or invalid API key" }
+
+[[plugins]]
+id = "header-normalizer"
+path = "/usr/local/share/tracegate/plugins/header-normalizer.wasm"
+hook = "before_request"
+routes = ["payments"]
+timeout_ms = 50
+memory_limit_bytes = 16777216
+fuel = 10000000
+body_preview_bytes = 1024
+raw_headers = []
+config = { set_header = "x-tracegate-policy", set_value = "normalized", remove_header = "x-remove-me" }
+
+[[plugins]]
+id = "timeout-normalizer"
+path = "/usr/local/share/tracegate/plugins/header-normalizer.wasm"
+hook = "before_request"
+routes = ["plugin-timeout"]
+timeout_ms = 1
+memory_limit_bytes = 16777216
+fuel = 1000000000
+body_preview_bytes = 0
+raw_headers = []
+config = { spin_iterations = "100000000" }

@@ -1,5 +1,9 @@
 [workspace]
 resolver = "3"
+exclude = [
+    "examples/plugins/api-key-guard",
+    "examples/plugins/header-normalizer",
+]
 members = [
     "crates/tracegate",
     "crates/tracegate-config",
@@ -8,6 +12,7 @@ members = [
     "crates/tracegate-proxy",
     "crates/tracegate-replay",
     "crates/tracegate-storage",
+    "crates/tracegate-wasm",
     "crates/tracegate-demo-backend",
 ]
 
@@ -48,3 +53,6 @@ tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 url = "2.5"
 uuid = { version = "1.17", features = ["v7", "serde"] }
+wasmtime = "46.0.1"
+wasmtime-wasi = "46.0.1"
+wit-bindgen = "0.58"

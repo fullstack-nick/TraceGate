@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     fmt,
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -35,6 +36,7 @@ pub struct AppConfig {
     pub redaction: RedactionConfig,
     pub observability: ObservabilityConfig,
     pub routes: Vec<Route>,
+    pub plugins: Vec<PluginConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +150,45 @@ pub struct CaptureConfig {
     pub slow_threshold: Duration,
     pub capture_request_body: bool,
     pub capture_response_body_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PluginHook {
+    BeforeRequest,
+}
+
+impl PluginHook {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::BeforeRequest => "before_request",
+        }
+    }
+}
+
+impl fmt::Display for PluginHook {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginConfigValue {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginConfig {
+    pub id: String,
+    pub path: PathBuf,
+    pub hook: PluginHook,
+    pub routes: Vec<String>,
+    pub timeout: Duration,
+    pub memory_limit_bytes: u64,
+    pub fuel: u64,
+    pub body_preview_bytes: u64,
+    pub raw_headers: Vec<String>,
+    pub config: Vec<PluginConfigValue>,
 }
 
 impl Default for CaptureConfig {

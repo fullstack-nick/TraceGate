@@ -49,6 +49,10 @@ struct TelemetryInner {
     captures: Counter,
     capture_dropped: Counter,
     retention_runs: Counter,
+    plugin_decisions: Family<PluginDecisionLabels, Counter>,
+    plugin_duration: Family<PluginDecisionLabels, Histogram, HistogramConstructor>,
+    plugin_timeouts: Family<PluginFailureLabels, Counter>,
+    plugin_errors: Family<PluginFailureLabels, Counter>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
@@ -63,6 +67,20 @@ struct UpstreamErrorLabels {
     route_id: String,
     method: String,
     status: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
+struct PluginDecisionLabels {
+    plugin_id: String,
+    route_id: String,
+    action: String,
+    outcome: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
+struct PluginFailureLabels {
+    plugin_id: String,
+    route_id: String,
 }
 
 #[derive(Clone)]
@@ -83,6 +101,17 @@ pub struct RequestMetric {
     pub status: u16,
     pub latency_seconds: f64,
     pub upstream_error: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PluginDecisionMetric {
+    pub plugin_id: String,
+    pub route_id: String,
+    pub action: String,
+    pub outcome: String,
+    pub duration_seconds: f64,
+    pub timed_out: bool,
+    pub errored: bool,
 }
 
 pub struct ObservabilityRuntime {
@@ -119,6 +148,17 @@ impl Telemetry {
         let captures = Counter::default();
         let capture_dropped = Counter::default();
         let retention_runs = Counter::default();
+        let plugin_decisions = Family::<PluginDecisionLabels, Counter>::default();
+        let plugin_duration =
+            Family::<PluginDecisionLabels, Histogram, HistogramConstructor>::new_with_constructor(
+                HistogramConstructor {
+                    buckets: vec![
+                        0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+                    ],
+                },
+            );
+        let plugin_timeouts = Family::<PluginFailureLabels, Counter>::default();
+        let plugin_errors = Family::<PluginFailureLabels, Counter>::default();
         let mut registry = Registry::default();
 
         registry.register(
@@ -151,6 +191,26 @@ impl Telemetry {
             "Capture-store retention runs completed by TraceGate.",
             retention_runs.clone(),
         );
+        registry.register(
+            "tracegate_plugin_decisions",
+            "WASM policy plugin decisions made by TraceGate.",
+            plugin_decisions.clone(),
+        );
+        registry.register(
+            "tracegate_plugin_duration_seconds",
+            "WASM policy plugin decision duration in seconds.",
+            plugin_duration.clone(),
+        );
+        registry.register(
+            "tracegate_plugin_timeouts",
+            "WASM policy plugin invocations that timed out.",
+            plugin_timeouts.clone(),
+        );
+        registry.register(
+            "tracegate_plugin_errors",
+            "WASM policy plugin invocations that trapped or failed validation.",
+            plugin_errors.clone(),
+        );
 
         Self {
             inner: Arc::new(TelemetryInner {
@@ -162,6 +222,10 @@ impl Telemetry {
                 captures,
                 capture_dropped,
                 retention_runs,
+                plugin_decisions,
+                plugin_duration,
+                plugin_timeouts,
+                plugin_errors,
             }),
         }
     }
@@ -205,6 +269,37 @@ impl Telemetry {
 
     pub fn record_retention_run(&self) {
         self.inner.retention_runs.inc();
+    }
+
+    pub fn record_plugin_decision(&self, metric: PluginDecisionMetric) {
+        let labels = PluginDecisionLabels {
+            plugin_id: metric.plugin_id.clone(),
+            route_id: metric.route_id.clone(),
+            action: metric.action,
+            outcome: metric.outcome,
+        };
+        self.inner.plugin_decisions.get_or_create(&labels).inc();
+        self.inner
+            .plugin_duration
+            .get_or_create(&labels)
+            .observe(metric.duration_seconds);
+
+        let failure_labels = PluginFailureLabels {
+            plugin_id: metric.plugin_id,
+            route_id: metric.route_id,
+        };
+        if metric.timed_out {
+            self.inner
+                .plugin_timeouts
+                .get_or_create(&failure_labels)
+                .inc();
+        }
+        if metric.errored {
+            self.inner
+                .plugin_errors
+                .get_or_create(&failure_labels)
+                .inc();
+        }
     }
 
     pub fn render_prometheus(&self) -> Result<String, std::fmt::Error> {
@@ -410,6 +505,26 @@ mod tests {
         assert!(metrics.contains("tracegate_captures_total"));
         assert!(metrics.contains("tracegate_capture_dropped_total"));
         assert!(metrics.contains("tracegate_storage_retention_runs_total"));
+    }
+
+    #[test]
+    fn metrics_record_plugin_decisions() {
+        let telemetry = Telemetry::new(&config(true));
+
+        telemetry.record_plugin_decision(PluginDecisionMetric {
+            plugin_id: "api-key-guard".to_owned(),
+            route_id: "payments".to_owned(),
+            action: "deny".to_owned(),
+            outcome: "ok".to_owned(),
+            duration_seconds: 0.002,
+            timed_out: false,
+            errored: false,
+        });
+
+        let metrics = telemetry.render_prometheus().unwrap();
+        assert!(metrics.contains("tracegate_plugin_decisions_total"));
+        assert!(metrics.contains("plugin_id=\"api-key-guard\""));
+        assert!(metrics.contains("tracegate_plugin_duration_seconds"));
     }
 
     #[test]

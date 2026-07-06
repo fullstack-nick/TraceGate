@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     convert::Infallible,
     future::Future,
     net::SocketAddr,
@@ -33,8 +34,15 @@ use tracegate_core::{
     RedactionConfig, Route, Router, StorageConfig, Upstream, request_id_from_headers,
     request_id_header_value,
 };
-use tracegate_observability::{RequestMetric, Telemetry};
-use tracegate_storage::{CaptureInsert, RequestInsert, Storage, StoredHeader, now_ms};
+use tracegate_observability::{PluginDecisionMetric, RequestMetric, Telemetry};
+use tracegate_storage::{
+    CaptureInsert, PluginDecisionInsert, PluginEvent as StoredPluginEvent, RequestInsert, Storage,
+    StoredHeader, now_ms,
+};
+use tracegate_wasm::{
+    HeaderMutation, PolicyDecisionRecord, PolicyEngine, PolicyHeader, PolicyRequest,
+    status_from_deny,
+};
 use tracing::{Instrument, field};
 
 type ProxyBody = BoxBody<Bytes, hyper::Error>;
@@ -46,6 +54,8 @@ pub enum ProxyError {
     Bind(#[from] std::io::Error),
     #[error("capture store error: {0}")]
     Storage(#[from] tracegate_storage::StorageError),
+    #[error("policy engine error: {0}")]
+    Policy(#[from] tracegate_wasm::PolicyError),
 }
 
 #[derive(Clone)]
@@ -56,6 +66,7 @@ struct Proxy {
     storage: Arc<Storage>,
     storage_config: StorageConfig,
     redaction: RedactionConfig,
+    policy: Arc<PolicyEngine>,
 }
 
 #[derive(Clone)]
@@ -138,7 +149,7 @@ where
     S: Future<Output = ()> + Send,
 {
     let storage = initialize_storage(&config, &telemetry).await?;
-    let proxy = Proxy::new(config, telemetry.clone(), storage.clone());
+    let proxy = Proxy::new(config, telemetry.clone(), storage.clone())?;
     spawn_retention_loop(storage, telemetry.clone());
     tokio::pin!(shutdown);
 
@@ -192,21 +203,27 @@ where
 }
 
 impl Proxy {
-    fn new(config: AppConfig, telemetry: Telemetry, storage: Arc<Storage>) -> Self {
+    fn new(
+        config: AppConfig,
+        telemetry: Telemetry,
+        storage: Arc<Storage>,
+    ) -> Result<Self, ProxyError> {
         let mut connector = HttpConnector::new();
         connector.enforce_http(true);
         let client = Client::builder(TokioExecutor::new()).build(connector);
         let storage_config = config.storage;
         let redaction = config.redaction;
+        let policy = Arc::new(PolicyEngine::new(&config.plugins)?);
 
-        Self {
+        Ok(Self {
             router: Arc::new(Router::new(config.routes)),
             client,
             telemetry,
             storage,
             storage_config,
             redaction,
-        }
+            policy,
+        })
     }
 
     async fn handle(
@@ -315,14 +332,175 @@ impl Proxy {
                     request_content_type: None,
                     response_capture_enabled: false,
                     response_capture_limit: 0,
+                    plugin_decisions: Vec::new(),
                 },
             ));
         };
 
+        let route_id = matched.route.id.clone();
+        let request_content_type = content_type(request.headers());
+        let retry_eligible = retry_eligible(&method, request.headers());
+        let mut template_headers = request.headers().clone();
+        let policy_headers = policy_headers(request.headers());
+        let policy_preview_limit = self.policy.max_body_preview_bytes(&route_id);
+        let (request_parts, request_body) = request.into_parts();
+        let mut request_body = request_body.boxed();
+        let body_preview = if policy_preview_limit > 0 {
+            match split_body_preview(request_body, policy_preview_limit).await {
+                Ok((preview, body)) => {
+                    request_body = body;
+                    Some(preview)
+                }
+                Err(err) => {
+                    let response = response_with_request_id_text(
+                        StatusCode::FORBIDDEN,
+                        "request denied by policy",
+                        &request_id,
+                    );
+                    let status = response.status();
+                    let error = Some(format!("policy_body_preview_failed: {err}"));
+                    self.log_request(RequestLogRecord {
+                        request_id: request_id.clone(),
+                        method: method.to_string(),
+                        path: redacted_path.clone(),
+                        route_id: Some(route_id.clone()),
+                        upstream: None,
+                        status: status.as_u16(),
+                        latency_ms: started.elapsed().as_millis(),
+                        error: error.clone(),
+                    });
+                    record_span_fields(Some(&route_id), None, status, started, error.as_deref());
+                    self.telemetry.record_request(RequestMetric {
+                        route_id: Some(route_id.clone()),
+                        method: method.to_string(),
+                        status: status.as_u16(),
+                        latency_seconds: started.elapsed().as_secs_f64(),
+                        upstream_error: false,
+                    });
+                    let record = RequestInsert {
+                        request_id,
+                        trace_id,
+                        route_id: Some(route_id),
+                        method: method.to_string(),
+                        path: request_path,
+                        redacted_query,
+                        query_hash,
+                        status: status.as_u16(),
+                        latency_ms: started.elapsed().as_millis(),
+                        upstream: None,
+                        is_error: false,
+                        is_slow: false,
+                        capture_policy: matched.route.capture.policy.to_string(),
+                        capture_dropped: false,
+                        created_at_ms: now_ms(),
+                    };
+
+                    return Ok(self.attach_storage_finalizer(
+                        response,
+                        StorageFinalizerInput {
+                            record,
+                            request_headers: request_headers_for_storage,
+                            request_capture: Arc::new(Mutex::new(CaptureBuffer::disabled())),
+                            should_capture: false,
+                            request_content_type: None,
+                            response_capture_enabled: false,
+                            response_capture_limit: 0,
+                            plugin_decisions: Vec::new(),
+                        },
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
+        let policy_evaluation = self
+            .policy
+            .evaluate(PolicyRequest {
+                route_id: route_id.clone(),
+                request_id: request_id.clone(),
+                method: method.to_string(),
+                path: request_path.clone(),
+                query: redacted_query.clone(),
+                headers: policy_headers,
+                sensitive_headers: self.redaction.headers.clone(),
+                client_address: remote_addr.to_string(),
+                body_preview,
+            })
+            .await;
+        self.record_plugin_metrics(&policy_evaluation.records);
+
+        if let Some(deny) = policy_evaluation.denied.clone() {
+            let status = status_from_deny(&deny);
+            let response = response_with_request_id_text(status, &deny.message, &request_id);
+            self.log_request(RequestLogRecord {
+                request_id: request_id.clone(),
+                method: method.to_string(),
+                path: redacted_path.clone(),
+                route_id: Some(route_id.clone()),
+                upstream: None,
+                status: status.as_u16(),
+                latency_ms: started.elapsed().as_millis(),
+                error: Some("policy_denied".to_owned()),
+            });
+            record_span_fields(
+                Some(&route_id),
+                None,
+                status,
+                started,
+                Some("policy_denied"),
+            );
+            self.telemetry.record_request(RequestMetric {
+                route_id: Some(route_id.clone()),
+                method: method.to_string(),
+                status: status.as_u16(),
+                latency_seconds: started.elapsed().as_secs_f64(),
+                upstream_error: status.is_server_error(),
+            });
+            let is_slow = started.elapsed() >= matched.route.capture.slow_threshold;
+            let record = RequestInsert {
+                request_id: request_id.clone(),
+                trace_id,
+                route_id: Some(route_id.clone()),
+                method: method.to_string(),
+                path: request_path,
+                redacted_query,
+                query_hash,
+                status: status.as_u16(),
+                latency_ms: started.elapsed().as_millis(),
+                upstream: None,
+                is_error: status.is_server_error(),
+                is_slow,
+                capture_policy: matched.route.capture.policy.to_string(),
+                capture_dropped: false,
+                created_at_ms: now_ms(),
+            };
+
+            return Ok(self.attach_storage_finalizer(
+                response,
+                StorageFinalizerInput {
+                    record,
+                    request_headers: request_headers_for_storage,
+                    request_capture: Arc::new(Mutex::new(CaptureBuffer::disabled())),
+                    should_capture: false,
+                    request_content_type: None,
+                    response_capture_enabled: false,
+                    response_capture_limit: 0,
+                    plugin_decisions: plugin_decision_inserts(
+                        &request_id,
+                        &policy_evaluation.records,
+                    ),
+                },
+            ));
+        }
+
+        apply_policy_mutations(
+            &mut template_headers,
+            &policy_evaluation.set_headers,
+            &policy_evaluation.remove_headers,
+        );
         let upstream = matched.route.select_upstream();
         let upstream_origin = upstream.origin();
-        let retry_eligible = retry_eligible(&method, request.headers());
-        let request_content_type = content_type(request.headers());
         let request_capture_enabled = matched.route.capture.policy != CapturePolicy::Off
             && matched.route.capture.capture_request_body
             && request_content_type
@@ -335,13 +513,13 @@ impl Proxy {
         )));
         let template = RequestTemplate {
             method,
-            uri: request.uri().clone(),
-            version: request.version(),
-            headers: request.headers().clone(),
+            uri: request_parts.uri,
+            version: request_parts.version,
+            headers: template_headers,
         };
 
         let result = if retry_eligible {
-            drop(request.into_body());
+            drop(request_body);
             self.request_with_retries(
                 &matched.route,
                 &upstream,
@@ -355,8 +533,7 @@ impl Proxy {
                 &matched.route,
                 &upstream,
                 &template,
-                CapturingBody::new(request.into_body().boxed(), request_capture.clone(), None)
-                    .boxed(),
+                CapturingBody::new(request_body, request_capture.clone(), None).boxed(),
                 &request_id,
                 remote_addr,
             )
@@ -398,7 +575,6 @@ impl Proxy {
             .capture
             .policy
             .should_capture(upstream_error, is_slow);
-        let route_id = matched.route.id.clone();
 
         self.log_request(RequestLogRecord {
             request_id: request_id.clone(),
@@ -446,7 +622,7 @@ impl Proxy {
         };
 
         let record = RequestInsert {
-            request_id,
+            request_id: request_id.clone(),
             trace_id,
             route_id: Some(route_id),
             method: template.method.to_string(),
@@ -473,6 +649,7 @@ impl Proxy {
                 request_content_type,
                 response_capture_enabled,
                 response_capture_limit,
+                plugin_decisions: plugin_decision_inserts(&request_id, &policy_evaluation.records),
             },
         ))
     }
@@ -532,6 +709,27 @@ impl Proxy {
         record.emit();
     }
 
+    fn record_plugin_metrics(&self, records: &[PolicyDecisionRecord]) {
+        for record in records {
+            let outcome = if record.timed_out {
+                "timeout"
+            } else if record.error.is_some() {
+                "error"
+            } else {
+                "ok"
+            };
+            self.telemetry.record_plugin_decision(PluginDecisionMetric {
+                plugin_id: record.plugin_id.clone(),
+                route_id: record.route_id.clone(),
+                action: record.action.clone(),
+                outcome: outcome.to_owned(),
+                duration_seconds: record.duration.as_secs_f64(),
+                timed_out: record.timed_out,
+                errored: record.error.is_some(),
+            });
+        }
+    }
+
     fn attach_storage_finalizer(
         &self,
         response: Response<ProxyBody>,
@@ -555,12 +753,70 @@ impl Proxy {
             should_capture: input.should_capture,
             request_content_type: input.request_content_type,
             response_content_type,
+            plugin_decisions: Some(input.plugin_decisions),
             finalized: false,
         };
         let body = CapturingBody::new(body, response_capture, Some(finalizer)).boxed();
 
         Response::from_parts(parts, body)
     }
+}
+
+pin_project_lite::pin_project! {
+    struct PrefixBody {
+        prefix: VecDeque<Frame<Bytes>>,
+        #[pin]
+        inner: ProxyBody,
+    }
+}
+
+impl PrefixBody {
+    fn new(prefix: VecDeque<Frame<Bytes>>, inner: ProxyBody) -> Self {
+        Self { prefix, inner }
+    }
+}
+
+impl Body for PrefixBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let mut this = self.project();
+        if let Some(frame) = this.prefix.pop_front() {
+            return Poll::Ready(Some(Ok(frame)));
+        }
+        this.inner.as_mut().poll_frame(cx)
+    }
+}
+
+async fn split_body_preview(
+    mut body: ProxyBody,
+    limit: u64,
+) -> Result<(Vec<u8>, ProxyBody), hyper::Error> {
+    if limit == 0 {
+        return Ok((Vec::new(), body));
+    }
+
+    let limit = limit.min(usize::MAX as u64) as usize;
+    let mut preview = Vec::with_capacity(limit.min(8192));
+    let mut prefix = VecDeque::new();
+
+    while preview.len() < limit {
+        let Some(frame) = body.frame().await else {
+            break;
+        };
+        let frame = frame?;
+        if let Some(data) = frame.data_ref() {
+            let remaining = limit.saturating_sub(preview.len());
+            preview.extend_from_slice(&data[..remaining.min(data.len())]);
+        }
+        prefix.push_back(frame);
+    }
+
+    Ok((preview, PrefixBody::new(prefix, body).boxed()))
 }
 
 struct StorageFinalizerInput {
@@ -571,6 +827,7 @@ struct StorageFinalizerInput {
     request_content_type: Option<String>,
     response_capture_enabled: bool,
     response_capture_limit: u64,
+    plugin_decisions: Vec<PluginDecisionInsert>,
 }
 
 async fn initialize_storage(
@@ -687,6 +944,7 @@ struct CaptureFinalizer {
     should_capture: bool,
     request_content_type: Option<String>,
     response_content_type: Option<String>,
+    plugin_decisions: Option<Vec<PluginDecisionInsert>>,
     finalized: bool,
 }
 
@@ -702,6 +960,7 @@ impl CaptureFinalizer {
         };
         let request_headers = self.request_headers.take().unwrap_or_default();
         let response_headers = self.response_headers.take().unwrap_or_default();
+        let plugin_decisions = self.plugin_decisions.take().unwrap_or_default();
         let request_snapshot = self
             .request_capture
             .lock()
@@ -728,7 +987,13 @@ impl CaptureFinalizer {
 
         tokio::spawn(async move {
             match storage
-                .insert_request(record, request_headers, response_headers, capture)
+                .insert_request(
+                    record,
+                    request_headers,
+                    response_headers,
+                    capture,
+                    plugin_decisions,
+                )
                 .await
             {
                 Ok(()) => {
@@ -843,6 +1108,74 @@ fn stored_headers(headers: &HeaderMap, redaction: &RedactionConfig) -> Vec<Store
             .then_with(|| left.value.cmp(&right.value))
     });
     stored
+}
+
+fn policy_headers(headers: &HeaderMap) -> Vec<PolicyHeader> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let value = value
+                .to_str()
+                .map(truncate_header_value)
+                .unwrap_or_else(|_| "<non-utf8>".to_owned());
+            PolicyHeader {
+                name: name.as_str().to_ascii_lowercase(),
+                value,
+            }
+        })
+        .collect()
+}
+
+fn apply_policy_mutations(
+    headers: &mut HeaderMap,
+    set_headers: &[HeaderMutation],
+    remove_headers: &[String],
+) {
+    for name in remove_headers {
+        if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
+            headers.remove(name);
+        }
+    }
+
+    for mutation in set_headers {
+        let Ok(name) = HeaderName::from_bytes(mutation.name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = HeaderValue::from_str(&mutation.value) else {
+            continue;
+        };
+        headers.insert(name, value);
+    }
+}
+
+fn plugin_decision_inserts(
+    request_id: &str,
+    records: &[PolicyDecisionRecord],
+) -> Vec<PluginDecisionInsert> {
+    records
+        .iter()
+        .map(|record| PluginDecisionInsert {
+            request_id: request_id.to_owned(),
+            plugin_id: record.plugin_id.clone(),
+            route_id: record.route_id.clone(),
+            action: record.action.clone(),
+            deny_status: record.deny_status,
+            set_headers: record.set_headers.clone(),
+            remove_headers: record.remove_headers.clone(),
+            events: record
+                .events
+                .iter()
+                .map(|event| StoredPluginEvent {
+                    name: event.name.clone(),
+                    code: event.code.clone(),
+                })
+                .collect(),
+            duration_ms: record.duration.as_millis(),
+            timed_out: record.timed_out,
+            error: record.error.clone(),
+            created_at_ms: now_ms(),
+        })
+        .collect()
 }
 
 fn truncate_header_value(value: &str) -> String {
@@ -1045,6 +1378,14 @@ fn response_with_request_id(
     body: &'static str,
     request_id: &str,
 ) -> Response<ProxyBody> {
+    response_with_request_id_text(status, body, request_id)
+}
+
+fn response_with_request_id_text(
+    status: StatusCode,
+    body: &str,
+    request_id: &str,
+) -> Response<ProxyBody> {
     let mut response = Response::new(full_body(body));
     *response.status_mut() = status;
     response.headers_mut().insert(
@@ -1054,8 +1395,8 @@ fn response_with_request_id(
     response
 }
 
-fn full_body(body: &'static str) -> ProxyBody {
-    Full::new(Bytes::from_static(body.as_bytes()))
+fn full_body(body: &str) -> ProxyBody {
+    Full::new(Bytes::from(body.to_owned()))
         .map_err(|never| match never {})
         .boxed()
 }

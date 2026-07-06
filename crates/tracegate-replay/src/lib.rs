@@ -612,7 +612,13 @@ mod tests {
         let (storage, _dir) = storage().await;
         let (target, shutdown) = start_echo_target().await;
         storage
-            .insert_request(request("GET", "req-get"), request_headers(), vec![], None)
+            .insert_request(
+                request("GET", "req-get"),
+                request_headers(),
+                vec![],
+                None,
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -646,6 +652,7 @@ mod tests {
                 request_headers(),
                 vec![],
                 Some(capture(Some(br#"{"ok":true}"#.to_vec()), false, false)),
+                vec![],
             )
             .await
             .unwrap();
@@ -677,6 +684,7 @@ mod tests {
                 request_headers(),
                 vec![],
                 Some(capture(Some(br#"{"ok":true}"#.to_vec()), false, false)),
+                vec![],
             )
             .await
             .unwrap();
@@ -722,6 +730,7 @@ mod tests {
                     request_headers(),
                     vec![],
                     capture,
+                    vec![],
                 )
                 .await
                 .unwrap();
@@ -762,7 +771,13 @@ mod tests {
     async fn rejects_original_upstream_target() {
         let (storage, _dir) = storage().await;
         storage
-            .insert_request(request("GET", "req-get"), request_headers(), vec![], None)
+            .insert_request(
+                request("GET", "req-get"),
+                request_headers(),
+                vec![],
+                None,
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -784,7 +799,13 @@ mod tests {
     async fn records_dispatch_failures() {
         let (storage, _dir) = storage().await;
         storage
-            .insert_request(request("GET", "req-get"), request_headers(), vec![], None)
+            .insert_request(
+                request("GET", "req-get"),
+                request_headers(),
+                vec![],
+                None,
+                vec![],
+            )
             .await
             .unwrap();
 

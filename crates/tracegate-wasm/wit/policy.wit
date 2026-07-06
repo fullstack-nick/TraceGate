@@ -1,0 +1,49 @@
+package tracegate:policy@0.1.0;
+
+interface types {
+    record header {
+        name: string,
+        value: string,
+    }
+
+    record key-value {
+        key: string,
+        value: string,
+    }
+
+    record policy-event {
+        name: string,
+        code: option<string>,
+    }
+
+    record deny-response {
+        status: u16,
+        message: string,
+    }
+
+    record request-policy-input {
+        route-id: string,
+        request-id: string,
+        method: string,
+        path: string,
+        query: option<string>,
+        headers: list<header>,
+        config: list<key-value>,
+        client-address: string,
+        body-preview: option<list<u8>>,
+    }
+
+    record request-policy-decision {
+        allow: bool,
+        deny: option<deny-response>,
+        set-headers: list<header>,
+        remove-headers: list<string>,
+        events: list<policy-event>,
+    }
+}
+
+world policy-plugin {
+    use types.{request-policy-input, request-policy-decision};
+
+    export before-request: func(request: request-policy-input) -> request-policy-decision;
+}

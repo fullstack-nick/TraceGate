@@ -325,11 +325,39 @@ slow_threshold_ms = 500
 
 [[plugins]]
 id = "api-key-guard"
-path = "./plugins/api_key_guard.wasm"
+path = "/usr/local/share/tracegate/plugins/api-key-guard.wasm"
 hook = "before_request"
 routes = ["payments"]
-timeout_ms = 5
+timeout_ms = 50
 memory_limit_bytes = 16777216
+fuel = 10000000
+body_preview_bytes = 0
+raw_headers = ["x-api-key"]
+config = { header = "x-api-key", expected = "tracegate-demo-key", message = "missing or invalid API key" }
+
+[[plugins]]
+id = "header-normalizer"
+path = "/usr/local/share/tracegate/plugins/header-normalizer.wasm"
+hook = "before_request"
+routes = ["payments"]
+timeout_ms = 50
+memory_limit_bytes = 16777216
+fuel = 10000000
+body_preview_bytes = 1024
+raw_headers = []
+config = { set_header = "x-tracegate-policy", set_value = "normalized" }
+
+[[plugins]]
+id = "timeout-normalizer"
+path = "/usr/local/share/tracegate/plugins/header-normalizer.wasm"
+hook = "before_request"
+routes = ["plugin-timeout"]
+timeout_ms = 1
+memory_limit_bytes = 16777216
+fuel = 1000000000
+body_preview_bytes = 0
+raw_headers = []
+config = { spin_iterations = "100000000" }
 ```
 
 Production mode validates:
@@ -430,6 +458,7 @@ First bundled example plugins:
 
 - `api-key-guard`: denies requests missing a configured API key header.
 - `header-normalizer`: adds or removes configured headers for upstream compatibility.
+- `timeout-normalizer`: demo configuration of `header-normalizer` that intentionally exceeds its deadline and proves fail-closed timeout handling.
 
 ## Observability Contract
 
@@ -451,6 +480,8 @@ Required metrics:
 - `tracegate_replay_runs_total`
 - `tracegate_plugin_decisions_total`
 - `tracegate_plugin_duration_seconds`
+- `tracegate_plugin_timeouts_total`
+- `tracegate_plugin_errors_total`
 - `tracegate_storage_retention_runs_total`
 
 Docker Compose includes:
@@ -473,7 +504,7 @@ Core safety rules:
 - Recording failure does not break proxy traffic; the request is marked `capture_dropped`.
 - Plugin failure fails closed on routes that attach the plugin.
 - Admin API never binds externally without TLS and bearer token auth.
-- Sensitive headers and query parameters are redacted before logs, storage, plugin input, and replay.
+- Sensitive headers and query parameters are redacted before logs, storage, and replay; plugin input receives only safe headers plus explicit per-plugin `raw_headers` allowlist entries.
 - Body capture is bounded by route and global caps.
 - Retention cleanup is part of the gateway process and exposed through metrics.
 - Replay is never silent; every replay creates a `replay_runs` record.

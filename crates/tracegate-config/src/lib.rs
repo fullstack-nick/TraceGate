@@ -1,10 +1,16 @@
-use std::{collections::HashSet, fs, net::SocketAddr, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use serde::Deserialize;
 use thiserror::Error;
 use tracegate_core::{
-    AppConfig, CaptureConfig, CapturePolicy, ObservabilityConfig, RedactionConfig, Route,
-    StorageConfig, Upstream,
+    AppConfig, CaptureConfig, CapturePolicy, ObservabilityConfig, PluginConfig, PluginConfigValue,
+    PluginHook, RedactionConfig, Route, StorageConfig, Upstream,
 };
 use url::Url;
 
@@ -39,6 +45,8 @@ pub struct RawConfig {
     pub observability: ObservabilityRawConfig,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+    #[serde(default)]
+    pub plugins: Vec<PluginRawConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,6 +152,28 @@ pub struct RouteConfig {
     pub capture_response_body_bytes: u64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PluginRawConfig {
+    pub id: String,
+    pub path: String,
+    #[serde(default = "default_plugin_hook")]
+    pub hook: String,
+    #[serde(default)]
+    pub routes: Vec<String>,
+    #[serde(default = "default_plugin_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_plugin_memory_limit_bytes")]
+    pub memory_limit_bytes: u64,
+    #[serde(default = "default_plugin_fuel")]
+    pub fuel: u64,
+    #[serde(default)]
+    pub body_preview_bytes: u64,
+    #[serde(default)]
+    pub raw_headers: Vec<String>,
+    #[serde(default)]
+    pub config: BTreeMap<String, String>,
+}
+
 pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig, ConfigError> {
     let path = path.as_ref();
     let display = path.display().to_string();
@@ -235,6 +265,8 @@ impl RawConfig {
             ));
         }
 
+        let plugins = validate_plugins(self.plugins, &route_ids)?;
+
         Ok(AppConfig {
             listen,
             admin_listen,
@@ -242,6 +274,7 @@ impl RawConfig {
             redaction,
             observability,
             routes,
+            plugins,
         })
     }
 }
@@ -442,6 +475,162 @@ fn validate_observability(
     })
 }
 
+fn validate_plugins(
+    raw_plugins: Vec<PluginRawConfig>,
+    route_ids: &HashSet<String>,
+) -> Result<Vec<PluginConfig>, ConfigError> {
+    let mut plugin_ids = HashSet::new();
+    let mut plugins = Vec::with_capacity(raw_plugins.len());
+
+    for plugin in raw_plugins {
+        validate_plugin_id(&plugin.id)?;
+        if !plugin_ids.insert(plugin.id.clone()) {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate plugin id `{}`",
+                plugin.id
+            )));
+        }
+
+        let path = plugin.path.trim();
+        if path.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "plugin `{}` path cannot be empty",
+                plugin.id
+            )));
+        }
+
+        let hook = match plugin.hook.trim().to_ascii_lowercase().as_str() {
+            "before_request" => PluginHook::BeforeRequest,
+            value => {
+                return Err(ConfigError::Invalid(format!(
+                    "plugin `{}` hook `{value}` must be before_request",
+                    plugin.id
+                )));
+            }
+        };
+
+        if plugin.routes.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "plugin `{}` must target at least one route",
+                plugin.id
+            )));
+        }
+
+        let mut routes = Vec::with_capacity(plugin.routes.len());
+        let mut seen_routes = HashSet::new();
+        for route in plugin.routes {
+            validate_route_id(&route)?;
+            if !route_ids.contains(&route) {
+                return Err(ConfigError::Invalid(format!(
+                    "plugin `{}` references unknown route `{route}`",
+                    plugin.id
+                )));
+            }
+            if seen_routes.insert(route.clone()) {
+                routes.push(route);
+            }
+        }
+
+        if plugin.timeout_ms == 0 || plugin.timeout_ms > 5_000 {
+            return Err(ConfigError::Invalid(format!(
+                "plugin `{}` timeout_ms must be between 1 and 5000",
+                plugin.id
+            )));
+        }
+
+        if plugin.memory_limit_bytes < 65_536 || plugin.memory_limit_bytes > 134_217_728 {
+            return Err(ConfigError::Invalid(format!(
+                "plugin `{}` memory_limit_bytes must be between 65536 and 134217728",
+                plugin.id
+            )));
+        }
+
+        if plugin.fuel == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "plugin `{}` fuel must be greater than 0",
+                plugin.id
+            )));
+        }
+
+        if plugin.body_preview_bytes > 65_536 {
+            return Err(ConfigError::Invalid(format!(
+                "plugin `{}` body_preview_bytes cannot exceed 65536",
+                plugin.id
+            )));
+        }
+
+        let raw_headers = normalize_redaction_list(
+            &format!("plugin `{}` raw_headers", plugin.id),
+            plugin.raw_headers,
+        )?;
+        let config = validate_plugin_config(&plugin.id, plugin.config)?;
+
+        plugins.push(PluginConfig {
+            id: plugin.id,
+            path: PathBuf::from(path),
+            hook,
+            routes,
+            timeout: Duration::from_millis(plugin.timeout_ms),
+            memory_limit_bytes: plugin.memory_limit_bytes,
+            fuel: plugin.fuel,
+            body_preview_bytes: plugin.body_preview_bytes,
+            raw_headers,
+            config,
+        });
+    }
+
+    Ok(plugins)
+}
+
+fn validate_plugin_id(id: &str) -> Result<(), ConfigError> {
+    if id.is_empty() {
+        return Err(ConfigError::Invalid("plugin id cannot be empty".to_owned()));
+    }
+
+    if !id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err(ConfigError::Invalid(format!(
+            "plugin id `{id}` may only contain ASCII letters, digits, hyphen, or underscore"
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_plugin_config(
+    plugin_id: &str,
+    raw: BTreeMap<String, String>,
+) -> Result<Vec<PluginConfigValue>, ConfigError> {
+    let mut values = Vec::with_capacity(raw.len());
+
+    for (key, value) in raw {
+        let key = key.trim().to_owned();
+        if key.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "plugin `{plugin_id}` config key cannot be empty"
+            )));
+        }
+        if !key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "plugin `{plugin_id}` config key `{key}` may only contain ASCII letters, digits, hyphen, underscore, or dot"
+            )));
+        }
+        if value.chars().count() > 4096 {
+            return Err(ConfigError::Invalid(format!(
+                "plugin `{plugin_id}` config value `{key}` cannot exceed 4096 characters"
+            )));
+        }
+        values.push(PluginConfigValue { key, value });
+    }
+
+    Ok(values)
+}
+
 fn validate_route_id(id: &str) -> Result<(), ConfigError> {
     if id.is_empty() {
         return Err(ConfigError::Invalid("route id cannot be empty".to_owned()));
@@ -587,6 +776,22 @@ fn default_slow_threshold_ms() -> u64 {
     500
 }
 
+fn default_plugin_hook() -> String {
+    "before_request".to_owned()
+}
+
+fn default_plugin_timeout_ms() -> u64 {
+    5
+}
+
+fn default_plugin_memory_limit_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn default_plugin_fuel() -> u64 {
+    10_000_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,6 +818,7 @@ mod tests {
                 capture_request_body: false,
                 capture_response_body_bytes: 0,
             }],
+            plugins: Vec::new(),
         }
     }
 
@@ -630,6 +836,7 @@ mod tests {
         assert!(config.observability.prometheus_enabled);
         assert_eq!(config.routes.len(), 1);
         assert_eq!(config.routes[0].capture.policy, CapturePolicy::Off);
+        assert!(config.plugins.is_empty());
     }
 
     #[test]
@@ -718,6 +925,46 @@ capture_response_body_bytes = 1024
     }
 
     #[test]
+    fn parses_v5_plugin_config() {
+        let raw = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[[routes]]
+id = "payments"
+hosts = ["*"]
+path_prefix = "/api/payments"
+upstreams = ["http://payments-service:4000"]
+
+[[plugins]]
+id = "api-key-guard"
+path = "/usr/local/share/tracegate/plugins/api-key-guard.wasm"
+hook = "before_request"
+routes = ["payments"]
+timeout_ms = 10
+memory_limit_bytes = 16777216
+fuel = 1000000
+body_preview_bytes = 1024
+raw_headers = ["X-API-Key"]
+config = { header = "x-api-key", expected = "demo-key" }
+"#;
+
+        let config = toml::from_str::<RawConfig>(raw)
+            .unwrap()
+            .validate()
+            .unwrap();
+
+        assert_eq!(config.plugins.len(), 1);
+        let plugin = &config.plugins[0];
+        assert_eq!(plugin.id, "api-key-guard");
+        assert_eq!(plugin.hook, PluginHook::BeforeRequest);
+        assert_eq!(plugin.routes, vec!["payments"]);
+        assert_eq!(plugin.raw_headers, vec!["x-api-key"]);
+        assert_eq!(plugin.body_preview_bytes, 1024);
+        assert!(plugin.config.iter().any(|item| item.key == "expected"));
+    }
+
+    #[test]
     fn rejects_invalid_admin_listen() {
         let mut raw = valid_raw_config();
         raw.server.admin_listen = Some("not-an-address".to_owned());
@@ -791,5 +1038,25 @@ capture_response_body_bytes = 1024
 
         let err = raw.validate().unwrap_err().to_string();
         assert!(err.contains("must be an origin"));
+    }
+
+    #[test]
+    fn rejects_plugin_unknown_route() {
+        let mut raw = valid_raw_config();
+        raw.plugins.push(PluginRawConfig {
+            id: "guard".to_owned(),
+            path: "/tmp/guard.wasm".to_owned(),
+            hook: "before_request".to_owned(),
+            routes: vec!["payments".to_owned()],
+            timeout_ms: 5,
+            memory_limit_bytes: 16 * 1024 * 1024,
+            fuel: 1_000_000,
+            body_preview_bytes: 0,
+            raw_headers: Vec::new(),
+            config: BTreeMap::new(),
+        });
+
+        let err = raw.validate().unwrap_err().to_string();
+        assert!(err.contains("unknown route"));
     }
 }

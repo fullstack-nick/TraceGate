@@ -4,7 +4,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{
     QueryBuilder, Row, Sqlite, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
@@ -101,6 +101,7 @@ pub struct RequestDetails {
     pub request_headers: Vec<StoredHeader>,
     pub response_headers: Vec<StoredHeader>,
     pub capture: Option<CaptureDetails>,
+    pub plugin_decisions: Vec<PluginDecision>,
     pub replay_runs: Vec<ReplayRun>,
 }
 
@@ -145,6 +146,58 @@ pub struct ReplayRun {
     pub latency_ms: i64,
     pub error: Option<String>,
     pub diff_summary: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct PluginEvent {
+    pub name: String,
+    pub code: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PluginDecisionInsert {
+    pub request_id: String,
+    pub plugin_id: String,
+    pub route_id: String,
+    pub action: String,
+    pub deny_status: Option<u16>,
+    pub set_headers: Vec<String>,
+    pub remove_headers: Vec<String>,
+    pub events: Vec<PluginEvent>,
+    pub duration_ms: u128,
+    pub timed_out: bool,
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
+pub struct PluginDecisionRow {
+    pub plugin_id: String,
+    pub route_id: String,
+    pub action: String,
+    pub deny_status: Option<i64>,
+    pub set_headers_json: String,
+    pub remove_headers_json: String,
+    pub events_json: String,
+    pub duration_ms: i64,
+    pub timed_out: bool,
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PluginDecision {
+    pub plugin_id: String,
+    pub route_id: String,
+    pub action: String,
+    pub deny_status: Option<i64>,
+    pub set_headers: Vec<String>,
+    pub remove_headers: Vec<String>,
+    pub events: Vec<PluginEvent>,
+    pub duration_ms: i64,
+    pub timed_out: bool,
+    pub error: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -205,6 +258,7 @@ impl Storage {
         request_headers: Vec<StoredHeader>,
         response_headers: Vec<StoredHeader>,
         capture: Option<CaptureInsert>,
+        plugin_decisions: Vec<PluginDecisionInsert>,
     ) -> Result<(), StorageError> {
         let mut tx = self.pool.begin().await?;
 
@@ -245,6 +299,10 @@ impl Storage {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM captures WHERE request_id = ?")
+            .bind(&record.request_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM plugin_decisions WHERE request_id = ?")
             .bind(&record.request_id)
             .execute(&mut *tx)
             .await?;
@@ -289,6 +347,33 @@ impl Storage {
             .bind(capture.request_body_sha256)
             .bind(capture.response_body_sha256)
             .bind(record.created_at_ms)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for decision in plugin_decisions {
+            sqlx::query(
+                r#"
+                INSERT INTO plugin_decisions (
+                    request_id, plugin_id, route_id, action, deny_status,
+                    set_headers_json, remove_headers_json, events_json,
+                    duration_ms, timed_out, error, created_at_ms
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(decision.request_id)
+            .bind(decision.plugin_id)
+            .bind(decision.route_id)
+            .bind(decision.action)
+            .bind(decision.deny_status.map(i64::from))
+            .bind(json_or_empty_array(&decision.set_headers))
+            .bind(json_or_empty_array(&decision.remove_headers))
+            .bind(json_or_empty_array(&decision.events))
+            .bind(decision.duration_ms.min(i64::MAX as u128) as i64)
+            .bind(decision.timed_out)
+            .bind(decision.error)
+            .bind(decision.created_at_ms)
             .execute(&mut *tx)
             .await?;
         }
@@ -386,14 +471,37 @@ impl Storage {
         .fetch_optional(&self.pool)
         .await?;
         let replay_runs = self.list_replay_runs(request_id).await?;
+        let plugin_decisions = self.list_plugin_decisions(request_id).await?;
 
         Ok(Some(RequestDetails {
             request,
             request_headers,
             response_headers,
             capture,
+            plugin_decisions,
             replay_runs,
         }))
+    }
+
+    pub async fn list_plugin_decisions(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<PluginDecision>, StorageError> {
+        let rows = sqlx::query_as::<_, PluginDecisionRow>(
+            r#"
+            SELECT plugin_id, route_id, action, deny_status, set_headers_json,
+                   remove_headers_json, events_json, duration_ms, timed_out, error,
+                   created_at_ms
+            FROM plugin_decisions
+            WHERE request_id = ?
+            ORDER BY id
+            "#,
+        )
+        .bind(request_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(PluginDecision::from).collect())
     }
 
     pub async fn insert_replay_run(&self, run: ReplayRunInsert) -> Result<(), StorageError> {
@@ -537,12 +645,34 @@ impl Storage {
     }
 }
 
+impl From<PluginDecisionRow> for PluginDecision {
+    fn from(row: PluginDecisionRow) -> Self {
+        Self {
+            plugin_id: row.plugin_id,
+            route_id: row.route_id,
+            action: row.action,
+            deny_status: row.deny_status,
+            set_headers: serde_json::from_str(&row.set_headers_json).unwrap_or_default(),
+            remove_headers: serde_json::from_str(&row.remove_headers_json).unwrap_or_default(),
+            events: serde_json::from_str(&row.events_json).unwrap_or_default(),
+            duration_ms: row.duration_ms,
+            timed_out: row.timed_out,
+            error: row.error,
+            created_at_ms: row.created_at_ms,
+        }
+    }
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+fn json_or_empty_array<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "[]".to_owned())
 }
 
 fn create_sqlite_parent_dir(url: &str) -> Result<(), StorageError> {
@@ -642,6 +772,23 @@ mod tests {
                     request_body_sha256: Some("request-hash".to_owned()),
                     response_body_sha256: Some("response-hash".to_owned()),
                 }),
+                vec![PluginDecisionInsert {
+                    request_id: "req-1".to_owned(),
+                    plugin_id: "api-key-guard".to_owned(),
+                    route_id: "payments".to_owned(),
+                    action: "deny".to_owned(),
+                    deny_status: Some(403),
+                    set_headers: vec!["x-policy".to_owned()],
+                    remove_headers: vec!["x-remove-me".to_owned()],
+                    events: vec![PluginEvent {
+                        name: "missing-api-key".to_owned(),
+                        code: Some("auth".to_owned()),
+                    }],
+                    duration_ms: 2,
+                    timed_out: false,
+                    error: None,
+                    created_at_ms: now_ms(),
+                }],
             )
             .await
             .unwrap();
@@ -663,6 +810,9 @@ mod tests {
             details.capture.unwrap().request_body,
             Some(br#"{"ok":true}"#.to_vec())
         );
+        assert_eq!(details.plugin_decisions.len(), 1);
+        assert_eq!(details.plugin_decisions[0].plugin_id, "api-key-guard");
+        assert_eq!(details.plugin_decisions[0].set_headers, vec!["x-policy"]);
     }
 
     #[tokio::test]
@@ -670,7 +820,7 @@ mod tests {
         let (storage, _dir) = storage(8).await;
         let old = now_ms() - 8 * 24 * 60 * 60 * 1000;
         storage
-            .insert_request(insert("old", old), vec![], vec![], None)
+            .insert_request(insert("old", old), vec![], vec![], None, vec![])
             .await
             .unwrap();
         storage
@@ -688,6 +838,7 @@ mod tests {
                     request_body_sha256: Some("request-hash".to_owned()),
                     response_body_sha256: Some("response-hash".to_owned()),
                 }),
+                vec![],
             )
             .await
             .unwrap();
@@ -708,7 +859,7 @@ mod tests {
     async fn creates_consistent_backup_file() {
         let (storage, dir) = storage(4096).await;
         storage
-            .insert_request(insert("req-1", now_ms()), vec![], vec![], None)
+            .insert_request(insert("req-1", now_ms()), vec![], vec![], None, vec![])
             .await
             .unwrap();
 
@@ -723,7 +874,7 @@ mod tests {
     async fn persists_replay_runs_with_request_details() {
         let (storage, _dir) = storage(4096).await;
         storage
-            .insert_request(insert("req-1", now_ms()), vec![], vec![], None)
+            .insert_request(insert("req-1", now_ms()), vec![], vec![], None, vec![])
             .await
             .unwrap();
         storage

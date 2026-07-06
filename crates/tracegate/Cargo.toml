@@ -15,4 +15,5 @@ tracegate-observability = { path = "../tracegate-observability" }
 tracegate-proxy = { path = "../tracegate-proxy" }
 tracegate-replay = { path = "../tracegate-replay" }
 tracegate-storage = { path = "../tracegate-storage" }
+tracegate-wasm = { path = "../tracegate-wasm" }
 tokio.workspace = true

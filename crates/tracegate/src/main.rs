@@ -44,6 +44,10 @@ enum Command {
         #[command(subcommand)]
         command: StorageCommand,
     },
+    Plugins {
+        #[command(subcommand)]
+        command: PluginsCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -99,6 +103,15 @@ enum StorageCommand {
         config: PathBuf,
         #[arg(long)]
         output: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PluginsCommand {
+    Inspect {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -222,6 +235,35 @@ async fn main() -> anyhow::Result<()> {
                 println!("storage backup written: {}", output.display());
             }
         },
+        Command::Plugins { command } => match command {
+            PluginsCommand::Inspect { path, json } => {
+                let inspection = tracegate_wasm::PolicyEngine::inspect(&path)
+                    .with_context(|| format!("failed to inspect {}", path.display()))?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&inspection)?);
+                } else {
+                    println!("path: {}", inspection.path);
+                    println!("compatible: {}", inspection.compatible);
+                    println!("contract: {}", inspection.contract);
+                    println!("imports:");
+                    if inspection.imports.is_empty() {
+                        println!("  none");
+                    } else {
+                        for import in &inspection.imports {
+                            println!("  {import}");
+                        }
+                    }
+                    println!("exports:");
+                    if inspection.exports.is_empty() {
+                        println!("  none");
+                    } else {
+                        for export in &inspection.exports {
+                            println!("  {export}");
+                        }
+                    }
+                }
+            }
+        },
     }
 
     Ok(())
@@ -326,6 +368,44 @@ fn print_request_details(details: &RequestDetails) {
         println!("  {}: {}", header.name, header.value);
     }
 
+    println!("plugin_decisions:");
+    if details.plugin_decisions.is_empty() {
+        println!("  none");
+    } else {
+        for decision in &details.plugin_decisions {
+            println!("  plugin_id: {}", decision.plugin_id);
+            println!("    route_id: {}", decision.route_id);
+            println!("    action: {}", decision.action);
+            println!(
+                "    deny_status: {}",
+                decision
+                    .deny_status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "none".to_owned())
+            );
+            println!("    set_headers: {}", display_list(&decision.set_headers));
+            println!(
+                "    remove_headers: {}",
+                display_list(&decision.remove_headers)
+            );
+            println!("    timed_out: {}", decision.timed_out);
+            println!("    error: {}", decision.error.as_deref().unwrap_or("none"));
+            println!("    duration_ms: {}", decision.duration_ms);
+            println!(
+                "    events: {}",
+                decision
+                    .events
+                    .iter()
+                    .map(|event| match event.code.as_deref() {
+                        Some(code) => format!("{}:{code}", event.name),
+                        None => event.name.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+    }
+
     if let Some(capture) = &details.capture {
         println!("capture:");
         println!(
@@ -409,5 +489,13 @@ fn display_path(row: &RequestSummary) -> String {
     match row.redacted_query.as_deref() {
         Some(query) => format!("{}?{query}", row.path),
         None => row.path.clone(),
+    }
+}
+
+fn display_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_owned()
+    } else {
+        values.join(",")
     }
 }

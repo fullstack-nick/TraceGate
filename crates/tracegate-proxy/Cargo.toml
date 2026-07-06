@@ -21,6 +21,7 @@ tokio.workspace = true
 tracegate-core = { path = "../tracegate-core" }
 tracegate-observability = { path = "../tracegate-observability" }
 tracegate-storage = { path = "../tracegate-storage" }
+tracegate-wasm = { path = "../tracegate-wasm" }
 tracing.workspace = true
 
 [dev-dependencies]

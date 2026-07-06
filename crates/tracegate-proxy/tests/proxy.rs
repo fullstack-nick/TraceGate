@@ -1,4 +1,13 @@
-use std::{net::SocketAddr, path::Path, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     Router,
@@ -9,8 +18,8 @@ use axum::{
 };
 use tokio::{net::TcpListener, sync::oneshot};
 use tracegate_core::{
-    AppConfig, CaptureConfig, CapturePolicy, ObservabilityConfig, RedactionConfig, Route,
-    StorageConfig, Upstream,
+    AppConfig, CaptureConfig, CapturePolicy, ObservabilityConfig, PluginConfig, PluginConfigValue,
+    PluginHook, RedactionConfig, Route, StorageConfig, Upstream,
 };
 use tracegate_observability::{Telemetry, trace_id_hex_from_traceparent};
 use tracegate_proxy::{serve_listener, serve_listeners};
@@ -91,6 +100,46 @@ async fn start_header_echo_backend() -> (SocketAddr, oneshot::Sender<()>) {
     (addr, shutdown_tx)
 }
 
+async fn start_policy_header_backend() -> (SocketAddr, Arc<AtomicUsize>, oneshot::Sender<()>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_handler = hits.clone();
+    let app = Router::new().route(
+        "/{*path}",
+        any(move |headers: HeaderMap, body: AxumBytes| {
+            let hits = hits_for_handler.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let policy = headers
+                    .get("x-tracegate-policy")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("")
+                    .to_owned();
+
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/plain")
+                    .body(Body::from(format!("{policy}:{}", body.len())))
+                    .unwrap()
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    (addr, hits, shutdown_tx)
+}
+
 async fn start_proxy(route: Route) -> (SocketAddr, oneshot::Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -120,6 +169,31 @@ async fn start_proxy_with_storage(
 
     let mut config = app_config(addr, "127.0.0.1:0".parse().unwrap(), vec![route]);
     config.storage = storage;
+    let telemetry = Telemetry::new(&config.observability);
+
+    tokio::spawn(async move {
+        serve_listener(listener, config, telemetry, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    (addr, shutdown_tx)
+}
+
+async fn start_proxy_with_storage_and_plugins(
+    route: Route,
+    storage: StorageConfig,
+    plugins: Vec<PluginConfig>,
+) -> (SocketAddr, oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    let mut config = app_config(addr, "127.0.0.1:0".parse().unwrap(), vec![route]);
+    config.storage = storage;
+    config.plugins = plugins;
     let telemetry = Telemetry::new(&config.observability);
 
     tokio::spawn(async move {
@@ -181,6 +255,7 @@ fn app_config(listen: SocketAddr, admin_listen: SocketAddr, routes: Vec<Route>) 
             json_logs: true,
         },
         routes,
+        plugins: Vec::new(),
     }
 }
 
@@ -245,6 +320,128 @@ fn route_to_with_capture(
         0,
         capture,
     )
+}
+
+fn api_key_plugin() -> PluginConfig {
+    PluginConfig {
+        id: "api-key-guard".to_owned(),
+        path: example_plugin_path(
+            "api-key-guard",
+            "tracegate_api_key_guard.wasm",
+            &API_KEY_PLUGIN,
+        ),
+        hook: PluginHook::BeforeRequest,
+        routes: vec!["test".to_owned()],
+        timeout: Duration::from_millis(100),
+        memory_limit_bytes: 16 * 1024 * 1024,
+        fuel: 10_000_000,
+        body_preview_bytes: 0,
+        raw_headers: vec!["x-api-key".to_owned()],
+        config: vec![
+            PluginConfigValue {
+                key: "header".to_owned(),
+                value: "x-api-key".to_owned(),
+            },
+            PluginConfigValue {
+                key: "expected".to_owned(),
+                value: "tracegate-demo-key".to_owned(),
+            },
+        ],
+    }
+}
+
+fn header_normalizer_plugin() -> PluginConfig {
+    PluginConfig {
+        id: "header-normalizer".to_owned(),
+        path: example_plugin_path(
+            "header-normalizer",
+            "tracegate_header_normalizer.wasm",
+            &HEADER_NORMALIZER_PLUGIN,
+        ),
+        hook: PluginHook::BeforeRequest,
+        routes: vec!["test".to_owned()],
+        timeout: Duration::from_millis(100),
+        memory_limit_bytes: 16 * 1024 * 1024,
+        fuel: 10_000_000,
+        body_preview_bytes: 16,
+        raw_headers: Vec::new(),
+        config: vec![
+            PluginConfigValue {
+                key: "set_header".to_owned(),
+                value: "x-tracegate-policy".to_owned(),
+            },
+            PluginConfigValue {
+                key: "set_value".to_owned(),
+                value: "normalized".to_owned(),
+            },
+        ],
+    }
+}
+
+fn timeout_normalizer_plugin() -> PluginConfig {
+    PluginConfig {
+        id: "timeout-normalizer".to_owned(),
+        path: example_plugin_path(
+            "header-normalizer",
+            "tracegate_header_normalizer.wasm",
+            &HEADER_NORMALIZER_PLUGIN,
+        ),
+        hook: PluginHook::BeforeRequest,
+        routes: vec!["test".to_owned()],
+        timeout: Duration::from_millis(1),
+        memory_limit_bytes: 16 * 1024 * 1024,
+        fuel: 1_000_000_000,
+        body_preview_bytes: 0,
+        raw_headers: Vec::new(),
+        config: vec![PluginConfigValue {
+            key: "spin_iterations".to_owned(),
+            value: "100000000".to_owned(),
+        }],
+    }
+}
+
+static API_KEY_PLUGIN: OnceLock<PathBuf> = OnceLock::new();
+static HEADER_NORMALIZER_PLUGIN: OnceLock<PathBuf> = OnceLock::new();
+
+fn example_plugin_path(
+    plugin_dir: &str,
+    wasm_name: &str,
+    cache: &'static OnceLock<PathBuf>,
+) -> PathBuf {
+    cache
+        .get_or_init(|| {
+            let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .canonicalize()
+                .unwrap();
+            let manifest = repo
+                .join("examples")
+                .join("plugins")
+                .join(plugin_dir)
+                .join("Cargo.toml");
+            let status = Command::new("cargo")
+                .args([
+                    "build",
+                    "--manifest-path",
+                    manifest.to_str().unwrap(),
+                    "--target",
+                    "wasm32-wasip2",
+                    "--release",
+                ])
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to build {plugin_dir}");
+            repo.join("examples")
+                .join("plugins")
+                .join(plugin_dir)
+                .join("target")
+                .join("wasm32-wasip2")
+                .join("release")
+                .join(wasm_name)
+        })
+        .clone()
 }
 
 #[tokio::test]
@@ -472,6 +669,143 @@ async fn captures_failed_request_with_redaction_and_truncation() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
+
+    let _ = proxy_shutdown.send(());
+    let _ = backend_shutdown.send(());
+}
+
+#[tokio::test]
+async fn wasm_policy_denies_missing_api_key_before_upstream() {
+    let (backend_addr, hits, backend_shutdown) = start_policy_header_backend().await;
+    let storage = storage_config();
+    let storage_for_query = storage.clone();
+    let (proxy_addr, proxy_shutdown) = start_proxy_with_storage_and_plugins(
+        route_to(backend_addr, "/api/payments", Duration::from_secs(1), 0),
+        storage,
+        vec![api_key_plugin()],
+    )
+    .await;
+
+    let response = reqwest::get(format!("http://{proxy_addr}/api/payments/ok"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let _ = response.text().await.unwrap();
+
+    let storage = Storage::connect(&storage_for_query).await.unwrap();
+    storage.migrate().await.unwrap();
+    let details = wait_for_request(&storage, &request_id).await;
+
+    assert_eq!(details.request.status, 403);
+    assert_eq!(details.request.upstream.as_deref(), None);
+    assert_eq!(details.plugin_decisions.len(), 1);
+    assert_eq!(details.plugin_decisions[0].plugin_id, "api-key-guard");
+    assert_eq!(details.plugin_decisions[0].action, "deny");
+    assert_eq!(details.plugin_decisions[0].deny_status, Some(403));
+
+    let _ = proxy_shutdown.send(());
+    let _ = backend_shutdown.send(());
+}
+
+#[tokio::test]
+async fn wasm_policy_allows_valid_key_and_mutates_headers_with_body_preview() {
+    let (backend_addr, hits, backend_shutdown) = start_policy_header_backend().await;
+    let storage = storage_config();
+    let storage_for_query = storage.clone();
+    let (proxy_addr, proxy_shutdown) = start_proxy_with_storage_and_plugins(
+        route_to(backend_addr, "/api/payments", Duration::from_secs(1), 0),
+        storage,
+        vec![api_key_plugin(), header_normalizer_plugin()],
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/api/payments/ok"))
+        .header("x-api-key", "tracegate-demo-key")
+        .body("hello preview")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(response.text().await.unwrap(), "normalized:13");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    let storage = Storage::connect(&storage_for_query).await.unwrap();
+    storage.migrate().await.unwrap();
+    let details = wait_for_request(&storage, &request_id).await;
+
+    assert_eq!(details.plugin_decisions.len(), 2);
+    assert_eq!(details.plugin_decisions[0].action, "allow");
+    assert_eq!(details.plugin_decisions[1].plugin_id, "header-normalizer");
+    assert_eq!(
+        details.plugin_decisions[1].set_headers,
+        vec!["x-tracegate-policy"]
+    );
+    assert!(
+        details.plugin_decisions[1]
+            .events
+            .iter()
+            .any(|event| event.name == "headers-normalized-with-body-preview")
+    );
+
+    let _ = proxy_shutdown.send(());
+    let _ = backend_shutdown.send(());
+}
+
+#[tokio::test]
+async fn wasm_policy_timeout_denies_before_upstream() {
+    let (backend_addr, hits, backend_shutdown) = start_policy_header_backend().await;
+    let storage = storage_config();
+    let storage_for_query = storage.clone();
+    let (proxy_addr, proxy_shutdown) = start_proxy_with_storage_and_plugins(
+        route_to(backend_addr, "/api/payments", Duration::from_secs(1), 0),
+        storage,
+        vec![timeout_normalizer_plugin()],
+    )
+    .await;
+
+    let response = reqwest::get(format!("http://{proxy_addr}/api/payments/timeout"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let _ = response.text().await.unwrap();
+
+    let storage = Storage::connect(&storage_for_query).await.unwrap();
+    storage.migrate().await.unwrap();
+    let details = wait_for_request(&storage, &request_id).await;
+
+    assert_eq!(details.request.status, 403);
+    assert_eq!(details.request.upstream.as_deref(), None);
+    assert_eq!(details.plugin_decisions.len(), 1);
+    assert_eq!(details.plugin_decisions[0].plugin_id, "timeout-normalizer");
+    assert_eq!(details.plugin_decisions[0].action, "deny");
+    assert!(details.plugin_decisions[0].timed_out);
 
     let _ = proxy_shutdown.send(());
     let _ = backend_shutdown.send(());
