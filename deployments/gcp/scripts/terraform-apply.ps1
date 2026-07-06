@@ -4,7 +4,8 @@ param(
     [string] $Zone = "us-central1-a",
     [string] $MachineType = "e2-micro",
     [int] $DiskSizeGb = 30,
-    [string] $OperatorCidr = ""
+    [string] $OperatorCidr = "",
+    [switch] $AutoApprove
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,13 +22,19 @@ if ([string]::IsNullOrWhiteSpace($OperatorCidr)) {
 Push-Location $terraformDir
 try {
     terraform init
-    terraform apply `
-        -var "project_id=$ProjectId" `
-        -var "region=$Region" `
-        -var "zone=$Zone" `
-        -var "machine_type=$MachineType" `
-        -var "disk_size_gb=$DiskSizeGb" `
-        -var "ssh_source_cidr=$OperatorCidr"
+    $applyArgs = @(
+        "apply",
+        "-var", "project_id=$ProjectId",
+        "-var", "region=$Region",
+        "-var", "zone=$Zone",
+        "-var", "machine_type=$MachineType",
+        "-var", "disk_size_gb=$DiskSizeGb",
+        "-var", "ssh_source_cidr=$OperatorCidr"
+    )
+    if ($AutoApprove) {
+        $applyArgs += "-auto-approve"
+    }
+    terraform @applyArgs
 } finally {
     Pop-Location
 }
