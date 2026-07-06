@@ -1,0 +1,138 @@
+services:
+  tracegate:
+    image: ${TRACEGATE_IMAGE}
+    container_name: tracegate
+    command: ["tracegate", "serve", "--config", "/etc/tracegate/tracegate.toml"]
+    restart: unless-stopped
+    env_file:
+      - /opt/tracegate/secrets.env
+    ports:
+      - "8080:8080"
+    volumes:
+      - /opt/tracegate/tracegate.toml:/etc/tracegate/tracegate.toml:ro
+      - /opt/tracegate/tls:/etc/tracegate/tls:ro
+    depends_on:
+      - postgres
+      - otel-collector
+      - users-service
+      - payments-service
+      - payments-service-alt
+      - replay-target
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: tracegate-postgres
+    restart: unless-stopped
+    env_file:
+      - /opt/tracegate/secrets.env
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=32MB"
+      - "-c"
+      - "max_connections=20"
+    volumes:
+      - /opt/tracegate/postgres:/var/lib/postgresql/data
+    expose:
+      - "5432"
+
+  users-service:
+    image: ${TRACEGATE_IMAGE}
+    container_name: tracegate-users-service
+    command:
+      - "tracegate-demo-backend"
+      - "--service"
+      - "users"
+      - "--listen"
+      - "0.0.0.0:3443"
+      - "--tls-cert"
+      - "/etc/tracegate/tls/upstreams.crt"
+      - "--tls-key"
+      - "/etc/tracegate/tls/upstreams.key"
+    restart: unless-stopped
+    volumes:
+      - /opt/tracegate/tls:/etc/tracegate/tls:ro
+    expose:
+      - "3443"
+
+  payments-service:
+    image: ${TRACEGATE_IMAGE}
+    container_name: tracegate-payments-service
+    command:
+      - "tracegate-demo-backend"
+      - "--service"
+      - "payments"
+      - "--listen"
+      - "0.0.0.0:4443"
+      - "--tls-cert"
+      - "/etc/tracegate/tls/upstreams.crt"
+      - "--tls-key"
+      - "/etc/tracegate/tls/upstreams.key"
+    restart: unless-stopped
+    volumes:
+      - /opt/tracegate/tls:/etc/tracegate/tls:ro
+    expose:
+      - "4443"
+
+  payments-service-alt:
+    image: ${TRACEGATE_IMAGE}
+    container_name: tracegate-payments-service-alt
+    command:
+      - "tracegate-demo-backend"
+      - "--service"
+      - "payments"
+      - "--listen"
+      - "0.0.0.0:4444"
+      - "--tls-cert"
+      - "/etc/tracegate/tls/upstreams.crt"
+      - "--tls-key"
+      - "/etc/tracegate/tls/upstreams.key"
+    restart: unless-stopped
+    volumes:
+      - /opt/tracegate/tls:/etc/tracegate/tls:ro
+    expose:
+      - "4444"
+
+  replay-target:
+    image: ${TRACEGATE_IMAGE}
+    container_name: tracegate-replay-target
+    command:
+      - "tracegate-demo-backend"
+      - "--service"
+      - "replay"
+      - "--listen"
+      - "0.0.0.0:4000"
+    restart: unless-stopped
+    expose:
+      - "4000"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.155.0
+    container_name: tracegate-otel-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    restart: unless-stopped
+    volumes:
+      - /opt/tracegate/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.19.0
+    container_name: tracegate-jaeger
+    restart: unless-stopped
+    expose:
+      - "16686"
+      - "4317"
+
+  prometheus:
+    image: prom/prometheus:v3.13.0
+    container_name: tracegate-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=2h"
+    restart: unless-stopped
+    volumes:
+      - /opt/tracegate/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - /opt/tracegate/admin-token:/etc/prometheus/tracegate-admin-token:ro
+    depends_on:
+      - tracegate

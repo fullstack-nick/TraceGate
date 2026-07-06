@@ -121,10 +121,12 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Serve { config } => {
-            let config = tracegate_config::load_config(&config)
-                .with_context(|| format!("failed to load {}", config.display()))?;
+            let config_path = config;
+            let config = tracegate_config::load_config(&config_path)
+                .with_context(|| format!("failed to load {}", config_path.display()))?;
             let observability = tracegate_observability::init(&config.observability)?;
-            tracegate_proxy::serve(config, observability.telemetry()).await?;
+            tracegate_proxy::serve_with_config_path(config_path, config, observability.telemetry())
+                .await?;
             observability.shutdown();
         }
         Command::Config {
@@ -133,9 +135,12 @@ async fn main() -> anyhow::Result<()> {
             let config = tracegate_config::load_config(&config)
                 .with_context(|| format!("failed to load {}", config.display()))?;
             println!(
-                "config ok: listen={}, admin_listen={}, storage={}, retention_days={}, routes={}, prometheus={}",
+                "config ok: mode={}, listen={}, admin_listen={}, admin_auth={}, storage_driver={}, storage={}, retention_days={}, routes={}, prometheus={}",
+                config.mode,
                 config.listen,
                 config.admin_listen,
+                config.admin.token.is_some(),
+                config.storage.driver,
                 config.storage.url,
                 config.storage.retention_days,
                 config.routes.len(),

@@ -7,22 +7,29 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+arc-swap.workspace = true
 bytes.workspace = true
 http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
+hyper-rustls.workspace = true
 hyper-util.workspace = true
 pin-project-lite.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tracegate-core = { path = "../tracegate-core" }
+tracegate-config = { path = "../tracegate-config" }
 tracegate-observability = { path = "../tracegate-observability" }
 tracegate-storage = { path = "../tracegate-storage" }
 tracegate-wasm = { path = "../tracegate-wasm" }
 tracing.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

@@ -23,7 +23,7 @@ docker exec tracegate tracegate requests list --config /etc/tracegate/tracegate.
 docker exec tracegate tracegate requests list --config /etc/tracegate/tracegate.toml --slow --limit 20
 $showCommand
 docker exec tracegate tracegate storage prune --config /etc/tracegate/tracegate.toml
-docker exec tracegate tracegate storage backup --config /etc/tracegate/tracegate.toml --output /var/lib/tracegate/backups/tracegate-inspect-backup.db
+docker exec tracegate-postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB"' > /opt/tracegate/data/backups/tracegate-inspect-backup.sql
 ls -lah /opt/tracegate/data/backups
 "@
 

@@ -12,3 +12,6 @@ thiserror.workspace = true
 toml.workspace = true
 tracegate-core = { path = "../tracegate-core" }
 url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

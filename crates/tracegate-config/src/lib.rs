@@ -9,8 +9,9 @@ use std::{
 use serde::Deserialize;
 use thiserror::Error;
 use tracegate_core::{
-    AppConfig, CaptureConfig, CapturePolicy, ObservabilityConfig, PluginConfig, PluginConfigValue,
-    PluginHook, RedactionConfig, Route, StorageConfig, Upstream,
+    AdminConfig, AppConfig, CaptureConfig, CapturePolicy, ObservabilityConfig, PluginConfig,
+    PluginConfigValue, PluginHook, RedactionConfig, Route, RouteOptions, RuntimeMode,
+    StorageConfig, TlsConfig, Upstream, UpstreamTlsConfig,
 };
 use url::Url;
 
@@ -36,6 +37,10 @@ pub enum ConfigError {
 pub struct RawConfig {
     pub server: ServerConfig,
     #[serde(default)]
+    pub admin: AdminRawConfig,
+    #[serde(default)]
+    pub upstream_tls: UpstreamTlsRawConfig,
+    #[serde(default)]
     pub storage: StorageRawConfig,
     #[serde(default)]
     pub redaction: RedactionRawConfig,
@@ -51,9 +56,46 @@ pub struct RawConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
+    #[serde(default = "default_mode")]
+    pub mode: String,
     pub listen: String,
     #[serde(default)]
     pub admin_listen: Option<String>,
+    #[serde(default)]
+    pub tls: TlsRawConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TlsRawConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub cert_path: Option<String>,
+    #[serde(default)]
+    pub key_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminRawConfig {
+    #[serde(default = "default_admin_token_env")]
+    pub token_env: Option<String>,
+    #[serde(default)]
+    pub allow_internal_network: bool,
+}
+
+impl Default for AdminRawConfig {
+    fn default() -> Self {
+        Self {
+            token_env: default_admin_token_env(),
+            allow_internal_network: false,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct UpstreamTlsRawConfig {
+    #[serde(default)]
+    pub ca_cert_path: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -65,14 +107,18 @@ pub struct LoggingConfig {
 pub struct StorageRawConfig {
     #[serde(default = "default_storage_driver")]
     pub driver: String,
-    #[serde(default = "default_storage_url")]
-    pub url: String,
-    #[serde(default = "default_retention_days")]
-    pub retention_days: u32,
-    #[serde(default = "default_max_total_capture_bytes")]
-    pub max_total_capture_bytes: u64,
-    #[serde(default = "default_max_capture_bytes_per_request")]
-    pub max_capture_bytes_per_request: u64,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub url_env: Option<String>,
+    #[serde(default)]
+    pub retention_days: Option<u32>,
+    #[serde(default)]
+    pub max_total_capture_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_capture_bytes_per_request: Option<u64>,
+    #[serde(default)]
+    pub capture_queue_capacity: Option<usize>,
 }
 
 impl Default for StorageRawConfig {
@@ -80,10 +126,12 @@ impl Default for StorageRawConfig {
         let defaults = StorageConfig::default();
         Self {
             driver: defaults.driver,
-            url: defaults.url,
-            retention_days: defaults.retention_days,
-            max_total_capture_bytes: defaults.max_total_capture_bytes,
-            max_capture_bytes_per_request: defaults.max_capture_bytes_per_request,
+            url: Some(defaults.url),
+            url_env: None,
+            retention_days: Some(defaults.retention_days),
+            max_total_capture_bytes: Some(defaults.max_total_capture_bytes),
+            max_capture_bytes_per_request: Some(defaults.max_capture_bytes_per_request),
+            capture_queue_capacity: Some(defaults.capture_queue_capacity),
         }
     }
 }
@@ -142,6 +190,12 @@ pub struct RouteConfig {
     pub timeout_ms: u64,
     #[serde(default)]
     pub retries: u32,
+    #[serde(default = "default_concurrency_limit")]
+    pub concurrency_limit: usize,
+    #[serde(default = "default_passive_health_failures")]
+    pub passive_health_failures: u32,
+    #[serde(default = "default_passive_health_cooldown_ms")]
+    pub passive_health_cooldown_ms: u64,
     #[serde(default = "default_capture_policy")]
     pub capture_policy: String,
     #[serde(default = "default_slow_threshold_ms")]
@@ -160,12 +214,12 @@ pub struct PluginRawConfig {
     pub hook: String,
     #[serde(default)]
     pub routes: Vec<String>,
-    #[serde(default = "default_plugin_timeout_ms")]
-    pub timeout_ms: u64,
-    #[serde(default = "default_plugin_memory_limit_bytes")]
-    pub memory_limit_bytes: u64,
-    #[serde(default = "default_plugin_fuel")]
-    pub fuel: u64,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub memory_limit_bytes: Option<u64>,
+    #[serde(default)]
+    pub fuel: Option<u64>,
     #[serde(default)]
     pub body_preview_bytes: u64,
     #[serde(default)]
@@ -190,6 +244,7 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig, ConfigError> {
 
 impl RawConfig {
     pub fn validate(self) -> Result<AppConfig, ConfigError> {
+        let mode = validate_mode(&self.server.mode)?;
         let listen: SocketAddr = self
             .server
             .listen
@@ -201,8 +256,11 @@ impl RawConfig {
             .unwrap_or_else(default_admin_listen)
             .parse()
             .map_err(|err| ConfigError::Invalid(format!("server.admin_listen: {err}")))?;
+        let server_tls = validate_server_tls(self.server.tls, mode)?;
+        let admin = validate_admin(self.admin, admin_listen, mode)?;
+        let upstream_tls = validate_upstream_tls(self.upstream_tls)?;
         let observability = validate_observability(self.logging, self.observability)?;
-        let storage = validate_storage(self.storage)?;
+        let storage = validate_storage(self.storage, mode)?;
         let redaction = validate_redaction(self.redaction)?;
 
         if self.routes.is_empty() {
@@ -247,29 +305,61 @@ impl RawConfig {
                 )));
             }
 
+            if route.concurrency_limit == 0 || route.concurrency_limit > 100_000 {
+                return Err(ConfigError::Invalid(format!(
+                    "route `{}` concurrency_limit must be between 1 and 100000",
+                    route.id
+                )));
+            }
+
+            if route.passive_health_failures == 0 || route.passive_health_failures > 100 {
+                return Err(ConfigError::Invalid(format!(
+                    "route `{}` passive_health_failures must be between 1 and 100",
+                    route.id
+                )));
+            }
+
+            if route.passive_health_cooldown_ms == 0 || route.passive_health_cooldown_ms > 600_000 {
+                return Err(ConfigError::Invalid(format!(
+                    "route `{}` passive_health_cooldown_ms must be between 1 and 600000",
+                    route.id
+                )));
+            }
+
             let upstreams = route
                 .upstreams
                 .iter()
-                .map(|upstream| validate_upstream(&route.id, upstream))
+                .map(|upstream| validate_upstream(&route.id, upstream, mode, admin_listen))
                 .collect::<Result<Vec<_>, _>>()?;
             let capture = validate_capture(&route, &storage)?;
 
-            routes.push(Route::new_with_capture(
+            routes.push(Route::new_with_options(
                 route.id,
                 route.hosts,
                 route.path_prefix,
                 upstreams,
-                Duration::from_millis(route.timeout_ms),
-                route.retries,
-                capture,
+                RouteOptions {
+                    timeout: Duration::from_millis(route.timeout_ms),
+                    retries: route.retries,
+                    capture,
+                    concurrency_limit: route.concurrency_limit,
+                    passive_health_failures: route.passive_health_failures,
+                    passive_health_cooldown: Duration::from_millis(
+                        route.passive_health_cooldown_ms,
+                    ),
+                },
             ));
         }
 
-        let plugins = validate_plugins(self.plugins, &route_ids)?;
+        let plugins = validate_plugins(self.plugins, &route_ids, mode)?;
 
         Ok(AppConfig {
+            mode,
             listen,
             admin_listen,
+            server_tls,
+            admin,
+            upstream_tls,
             storage,
             redaction,
             observability,
@@ -279,60 +369,227 @@ impl RawConfig {
     }
 }
 
-fn validate_storage(raw: StorageRawConfig) -> Result<StorageConfig, ConfigError> {
-    let driver = raw.driver.trim().to_ascii_lowercase();
-    if driver != "sqlite" {
+fn validate_mode(raw: &str) -> Result<RuntimeMode, ConfigError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "demo" => Ok(RuntimeMode::Demo),
+        "production" => Ok(RuntimeMode::Production),
+        value => Err(ConfigError::Invalid(format!(
+            "server.mode `{value}` must be demo or production"
+        ))),
+    }
+}
+
+fn validate_server_tls(raw: TlsRawConfig, mode: RuntimeMode) -> Result<TlsConfig, ConfigError> {
+    if mode.is_production() && !raw.enabled {
+        return Err(ConfigError::Invalid(
+            "server.tls.enabled must be true in production mode".to_owned(),
+        ));
+    }
+
+    let cert_path = normalize_optional_path(raw.cert_path);
+    let key_path = normalize_optional_path(raw.key_path);
+
+    if raw.enabled {
+        let cert = cert_path.as_ref().ok_or_else(|| {
+            ConfigError::Invalid("server.tls.cert_path is required when TLS is enabled".to_owned())
+        })?;
+        let key = key_path.as_ref().ok_or_else(|| {
+            ConfigError::Invalid("server.tls.key_path is required when TLS is enabled".to_owned())
+        })?;
+        require_readable_file("server.tls.cert_path", cert)?;
+        require_readable_file("server.tls.key_path", key)?;
+    }
+
+    Ok(TlsConfig {
+        enabled: raw.enabled,
+        cert_path,
+        key_path,
+    })
+}
+
+fn validate_admin(
+    raw: AdminRawConfig,
+    admin_listen: SocketAddr,
+    mode: RuntimeMode,
+) -> Result<AdminConfig, ConfigError> {
+    if mode.is_production() && !admin_listen.ip().is_loopback() && !raw.allow_internal_network {
+        return Err(ConfigError::Invalid(
+            "admin.allow_internal_network must be true when production admin_listen is non-loopback"
+                .to_owned(),
+        ));
+    }
+
+    let token_env = raw
+        .token_env
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let token = match token_env.as_deref() {
+        Some(name) => std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
+        None => None,
+    };
+
+    if mode.is_production() && token.is_none() {
+        let name = token_env.as_deref().unwrap_or("TRACEGATE_ADMIN_TOKEN");
         return Err(ConfigError::Invalid(format!(
-            "storage.driver must be `sqlite` in v0.4, got `{}`",
+            "admin token env `{name}` must contain a non-empty token in production mode"
+        )));
+    }
+
+    Ok(AdminConfig {
+        token_env,
+        token,
+        allow_internal_network: raw.allow_internal_network,
+    })
+}
+
+fn validate_upstream_tls(raw: UpstreamTlsRawConfig) -> Result<UpstreamTlsConfig, ConfigError> {
+    let ca_cert_path = normalize_optional_path(raw.ca_cert_path);
+    if let Some(path) = ca_cert_path.as_ref() {
+        require_readable_file("upstream_tls.ca_cert_path", path)?;
+    }
+    Ok(UpstreamTlsConfig { ca_cert_path })
+}
+
+fn validate_storage(
+    raw: StorageRawConfig,
+    mode: RuntimeMode,
+) -> Result<StorageConfig, ConfigError> {
+    let driver = raw.driver.trim().to_ascii_lowercase();
+    if driver != "sqlite" && driver != "postgres" {
+        return Err(ConfigError::Invalid(format!(
+            "storage.driver must be `sqlite` or `postgres`, got `{}`",
             raw.driver
         )));
     }
 
-    let url = raw.url.trim().to_owned();
+    let explicit_url = raw
+        .url
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let url_env = raw
+        .url_env
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let url = match (explicit_url, url_env) {
+        (Some(url), None) => url,
+        (None, Some(env_name)) => std::env::var(&env_name)
+            .map(|value| value.trim().to_owned())
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "storage.url_env `{env_name}` must contain a non-empty URL"
+                ))
+            })?,
+        (Some(_), Some(_)) => {
+            return Err(ConfigError::Invalid(
+                "storage.url and storage.url_env cannot both be set".to_owned(),
+            ));
+        }
+        (None, None) => StorageConfig::default().url,
+    };
+
     if url.is_empty() {
         return Err(ConfigError::Invalid(
             "storage.url cannot be empty".to_owned(),
         ));
     }
 
-    if !url.starts_with("sqlite:") {
+    if driver == "sqlite" && !url.starts_with("sqlite:") {
         return Err(ConfigError::Invalid(format!(
             "storage.url `{url}` must use the sqlite scheme"
         )));
     }
 
-    if raw.retention_days == 0 || raw.retention_days > 365 {
+    if driver == "postgres" && !url.starts_with("postgres://") && !url.starts_with("postgresql://")
+    {
+        return Err(ConfigError::Invalid(format!(
+            "storage.url `{url}` must use the postgres scheme"
+        )));
+    }
+
+    let retention_days = required_or_default(
+        "storage.retention_days",
+        raw.retention_days,
+        StorageConfig::default().retention_days,
+        mode,
+    )?;
+    let max_total_capture_bytes = required_or_default(
+        "storage.max_total_capture_bytes",
+        raw.max_total_capture_bytes,
+        StorageConfig::default().max_total_capture_bytes,
+        mode,
+    )?;
+    let max_capture_bytes_per_request = required_or_default(
+        "storage.max_capture_bytes_per_request",
+        raw.max_capture_bytes_per_request,
+        StorageConfig::default().max_capture_bytes_per_request,
+        mode,
+    )?;
+    let capture_queue_capacity = required_or_default(
+        "storage.capture_queue_capacity",
+        raw.capture_queue_capacity,
+        StorageConfig::default().capture_queue_capacity,
+        mode,
+    )?;
+
+    if retention_days == 0 || retention_days > 365 {
         return Err(ConfigError::Invalid(
             "storage.retention_days must be between 1 and 365".to_owned(),
         ));
     }
 
-    if raw.max_total_capture_bytes == 0 {
+    if max_total_capture_bytes == 0 {
         return Err(ConfigError::Invalid(
             "storage.max_total_capture_bytes must be greater than 0".to_owned(),
         ));
     }
 
-    if raw.max_capture_bytes_per_request == 0 {
+    if max_capture_bytes_per_request == 0 {
         return Err(ConfigError::Invalid(
             "storage.max_capture_bytes_per_request must be greater than 0".to_owned(),
         ));
     }
 
-    if raw.max_capture_bytes_per_request > raw.max_total_capture_bytes {
+    if max_capture_bytes_per_request > max_total_capture_bytes {
         return Err(ConfigError::Invalid(
             "storage.max_capture_bytes_per_request cannot exceed storage.max_total_capture_bytes"
                 .to_owned(),
         ));
     }
 
+    if capture_queue_capacity == 0 || capture_queue_capacity > 1_000_000 {
+        return Err(ConfigError::Invalid(
+            "storage.capture_queue_capacity must be between 1 and 1000000".to_owned(),
+        ));
+    }
+
     Ok(StorageConfig {
         driver,
         url,
-        retention_days: raw.retention_days,
-        max_total_capture_bytes: raw.max_total_capture_bytes,
-        max_capture_bytes_per_request: raw.max_capture_bytes_per_request,
+        retention_days,
+        max_total_capture_bytes,
+        max_capture_bytes_per_request,
+        capture_queue_capacity,
     })
+}
+
+fn required_or_default<T: Copy>(
+    field: &str,
+    value: Option<T>,
+    default: T,
+    mode: RuntimeMode,
+) -> Result<T, ConfigError> {
+    match (value, mode.is_production()) {
+        (Some(value), _) => Ok(value),
+        (None, false) => Ok(default),
+        (None, true) => Err(ConfigError::Invalid(format!(
+            "{field} must be explicitly set in production mode"
+        ))),
+    }
 }
 
 fn validate_redaction(raw: RedactionRawConfig) -> Result<RedactionConfig, ConfigError> {
@@ -478,6 +735,7 @@ fn validate_observability(
 fn validate_plugins(
     raw_plugins: Vec<PluginRawConfig>,
     route_ids: &HashSet<String>,
+    mode: RuntimeMode,
 ) -> Result<Vec<PluginConfig>, ConfigError> {
     let mut plugin_ids = HashSet::new();
     let mut plugins = Vec::with_capacity(raw_plugins.len());
@@ -531,21 +789,40 @@ fn validate_plugins(
             }
         }
 
-        if plugin.timeout_ms == 0 || plugin.timeout_ms > 5_000 {
+        let timeout_ms = required_or_default(
+            &format!("plugin `{}` timeout_ms", plugin.id),
+            plugin.timeout_ms,
+            default_plugin_timeout_ms(),
+            mode,
+        )?;
+        let memory_limit_bytes = required_or_default(
+            &format!("plugin `{}` memory_limit_bytes", plugin.id),
+            plugin.memory_limit_bytes,
+            default_plugin_memory_limit_bytes(),
+            mode,
+        )?;
+        let fuel = required_or_default(
+            &format!("plugin `{}` fuel", plugin.id),
+            plugin.fuel,
+            default_plugin_fuel(),
+            mode,
+        )?;
+
+        if timeout_ms == 0 || timeout_ms > 5_000 {
             return Err(ConfigError::Invalid(format!(
                 "plugin `{}` timeout_ms must be between 1 and 5000",
                 plugin.id
             )));
         }
 
-        if plugin.memory_limit_bytes < 65_536 || plugin.memory_limit_bytes > 134_217_728 {
+        if !(65_536..=134_217_728).contains(&memory_limit_bytes) {
             return Err(ConfigError::Invalid(format!(
                 "plugin `{}` memory_limit_bytes must be between 65536 and 134217728",
                 plugin.id
             )));
         }
 
-        if plugin.fuel == 0 {
+        if fuel == 0 {
             return Err(ConfigError::Invalid(format!(
                 "plugin `{}` fuel must be greater than 0",
                 plugin.id
@@ -570,9 +847,9 @@ fn validate_plugins(
             path: PathBuf::from(path),
             hook,
             routes,
-            timeout: Duration::from_millis(plugin.timeout_ms),
-            memory_limit_bytes: plugin.memory_limit_bytes,
-            fuel: plugin.fuel,
+            timeout: Duration::from_millis(timeout_ms),
+            memory_limit_bytes,
+            fuel,
             body_preview_bytes: plugin.body_preview_bytes,
             raw_headers,
             config,
@@ -688,22 +965,41 @@ fn validate_path_prefix(route_id: &str, path_prefix: &str) -> Result<(), ConfigE
     Ok(())
 }
 
-fn validate_upstream(route_id: &str, value: &str) -> Result<Upstream, ConfigError> {
+fn validate_upstream(
+    route_id: &str,
+    value: &str,
+    mode: RuntimeMode,
+    admin_listen: SocketAddr,
+) -> Result<Upstream, ConfigError> {
     let parsed = Url::parse(value).map_err(|err| {
         ConfigError::Invalid(format!(
             "route `{route_id}` upstream `{value}` is invalid: {err}"
         ))
     })?;
 
-    if parsed.scheme() != "http" {
+    if mode.is_production() && parsed.scheme() != "https" {
         return Err(ConfigError::Invalid(format!(
-            "route `{route_id}` upstream `{value}` must use http in v0.1"
+            "route `{route_id}` upstream `{value}` must use https in production mode"
         )));
     }
 
-    if parsed.host_str().is_none() {
+    if !matches!(parsed.scheme(), "http" | "https") {
         return Err(ConfigError::Invalid(format!(
+            "route `{route_id}` upstream `{value}` must use http or https"
+        )));
+    }
+
+    let host = parsed.host_str().ok_or_else(|| {
+        ConfigError::Invalid(format!(
             "route `{route_id}` upstream `{value}` must include a host"
+        ))
+    })?;
+
+    if mode.is_production()
+        && is_blocked_upstream_host(host, parsed.port_or_known_default(), admin_listen)
+    {
+        return Err(ConfigError::Invalid(format!(
+            "route `{route_id}` upstream `{value}` targets a blocked local, metadata, or admin address"
         )));
     }
 
@@ -716,28 +1012,56 @@ fn validate_upstream(route_id: &str, value: &str) -> Result<Upstream, ConfigErro
     Upstream::parse(value).map_err(|err| ConfigError::Invalid(err.to_string()))
 }
 
+fn is_blocked_upstream_host(host: &str, port: Option<u16>, admin_listen: SocketAddr) -> bool {
+    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    if matches!(
+        host.as_str(),
+        "localhost" | "metadata.google.internal" | "169.254.169.254" | "::1"
+    ) {
+        return true;
+    }
+    if host.starts_with("127.") || host == "0.0.0.0" {
+        return true;
+    }
+    match (host.parse::<std::net::IpAddr>(), port) {
+        (Ok(ip), Some(port)) => admin_listen.ip() == ip && admin_listen.port() == port,
+        _ => false,
+    }
+}
+
+fn normalize_optional_path(value: Option<String>) -> Option<PathBuf> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn require_readable_file(field: &str, path: &Path) -> Result<(), ConfigError> {
+    let metadata = fs::metadata(path).map_err(|err| {
+        ConfigError::Invalid(format!(
+            "{field} `{}` is not readable: {err}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(ConfigError::Invalid(format!(
+            "{field} `{}` must be a file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn default_mode() -> String {
+    "demo".to_owned()
+}
+
 fn default_json_logging() -> bool {
     true
 }
 
 fn default_storage_driver() -> String {
     StorageConfig::default().driver
-}
-
-fn default_storage_url() -> String {
-    StorageConfig::default().url
-}
-
-fn default_retention_days() -> u32 {
-    StorageConfig::default().retention_days
-}
-
-fn default_max_total_capture_bytes() -> u64 {
-    StorageConfig::default().max_total_capture_bytes
-}
-
-fn default_max_capture_bytes_per_request() -> u64 {
-    StorageConfig::default().max_capture_bytes_per_request
 }
 
 fn default_redaction_headers() -> Vec<String> {
@@ -750,6 +1074,10 @@ fn default_redaction_query_params() -> Vec<String> {
 
 fn default_admin_listen() -> String {
     "127.0.0.1:9090".to_owned()
+}
+
+fn default_admin_token_env() -> Option<String> {
+    Some("TRACEGATE_ADMIN_TOKEN".to_owned())
 }
 
 fn default_service_name() -> String {
@@ -792,6 +1120,18 @@ fn default_plugin_fuel() -> u64 {
     10_000_000
 }
 
+fn default_concurrency_limit() -> usize {
+    100
+}
+
+fn default_passive_health_failures() -> u32 {
+    3
+}
+
+fn default_passive_health_cooldown_ms() -> u64 {
+    10_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,9 +1139,13 @@ mod tests {
     fn valid_raw_config() -> RawConfig {
         RawConfig {
             server: ServerConfig {
+                mode: "demo".to_owned(),
                 listen: "127.0.0.1:8080".to_owned(),
                 admin_listen: None,
+                tls: TlsRawConfig::default(),
             },
+            admin: AdminRawConfig::default(),
+            upstream_tls: UpstreamTlsRawConfig::default(),
             storage: StorageRawConfig::default(),
             redaction: RedactionRawConfig::default(),
             logging: LoggingConfig { json: Some(true) },
@@ -813,6 +1157,9 @@ mod tests {
                 upstreams: vec!["http://users-service:3000".to_owned()],
                 timeout_ms: 3000,
                 retries: 1,
+                concurrency_limit: 100,
+                passive_health_failures: 3,
+                passive_health_cooldown_ms: 10_000,
                 capture_policy: "off".to_owned(),
                 slow_threshold_ms: 500,
                 capture_request_body: false,
@@ -1001,6 +1348,9 @@ config = { header = "x-api-key", expected = "demo-key" }
             upstreams: vec!["http://other:3000".to_owned()],
             timeout_ms: 3000,
             retries: 0,
+            concurrency_limit: 100,
+            passive_health_failures: 3,
+            passive_health_cooldown_ms: 10_000,
             capture_policy: "off".to_owned(),
             slow_threshold_ms: 500,
             capture_request_body: false,
@@ -1014,8 +1364,8 @@ config = { header = "x-api-key", expected = "demo-key" }
     #[test]
     fn rejects_invalid_storage_caps() {
         let mut raw = valid_raw_config();
-        raw.storage.max_total_capture_bytes = 1024;
-        raw.storage.max_capture_bytes_per_request = 2048;
+        raw.storage.max_total_capture_bytes = Some(1024);
+        raw.storage.max_capture_bytes_per_request = Some(2048);
 
         let err = raw.validate().unwrap_err().to_string();
         assert!(err.contains("max_capture_bytes_per_request"));
@@ -1024,7 +1374,7 @@ config = { header = "x-api-key", expected = "demo-key" }
     #[test]
     fn rejects_route_capture_larger_than_storage_cap() {
         let mut raw = valid_raw_config();
-        raw.storage.max_capture_bytes_per_request = 1024;
+        raw.storage.max_capture_bytes_per_request = Some(1024);
         raw.routes[0].capture_response_body_bytes = 2048;
 
         let err = raw.validate().unwrap_err().to_string();
@@ -1048,9 +1398,9 @@ config = { header = "x-api-key", expected = "demo-key" }
             path: "/tmp/guard.wasm".to_owned(),
             hook: "before_request".to_owned(),
             routes: vec!["payments".to_owned()],
-            timeout_ms: 5,
-            memory_limit_bytes: 16 * 1024 * 1024,
-            fuel: 1_000_000,
+            timeout_ms: Some(5),
+            memory_limit_bytes: Some(16 * 1024 * 1024),
+            fuel: Some(1_000_000),
             body_preview_bytes: 0,
             raw_headers: Vec::new(),
             config: BTreeMap::new(),
@@ -1058,5 +1408,43 @@ config = { header = "x-api-key", expected = "demo-key" }
 
         let err = raw.validate().unwrap_err().to_string();
         assert!(err.contains("unknown route"));
+    }
+
+    #[test]
+    fn rejects_production_without_admin_token() {
+        let mut raw = valid_raw_config();
+        raw.server.mode = "production".to_owned();
+        raw.server.tls.enabled = true;
+        raw.server.tls.cert_path = Some("missing.crt".to_owned());
+        raw.server.tls.key_path = Some("missing.key".to_owned());
+
+        let err = raw.validate().unwrap_err().to_string();
+        assert!(err.contains("server.tls.cert_path") || err.contains("admin token"));
+    }
+
+    #[test]
+    fn rejects_production_http_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        std::fs::write(&cert, "not a real cert").unwrap();
+        std::fs::write(&key, "not a real key").unwrap();
+
+        let mut raw = valid_raw_config();
+        raw.server.mode = "production".to_owned();
+        raw.server.tls.enabled = true;
+        raw.server.tls.cert_path = Some(cert.display().to_string());
+        raw.server.tls.key_path = Some(key.display().to_string());
+        raw.admin.token_env = Some("TRACEGATE_CONFIG_TEST_TOKEN".to_owned());
+        unsafe {
+            std::env::set_var("TRACEGATE_CONFIG_TEST_TOKEN", "secret");
+        }
+        raw.storage.retention_days = Some(7);
+        raw.storage.max_total_capture_bytes = Some(4096);
+        raw.storage.max_capture_bytes_per_request = Some(1024);
+        raw.storage.capture_queue_capacity = Some(16);
+
+        let err = raw.validate().unwrap_err().to_string();
+        assert!(err.contains("must use https in production mode"));
     }
 }

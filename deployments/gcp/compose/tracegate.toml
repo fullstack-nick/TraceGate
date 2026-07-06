@@ -1,4 +1,5 @@
 [server]
+mode = "demo"
 listen = "0.0.0.0:8080"
 admin_listen = "0.0.0.0:9090"
 
@@ -11,6 +12,7 @@ url = "sqlite:///var/lib/tracegate/tracegate.db"
 retention_days = 7
 max_total_capture_bytes = 1073741824
 max_capture_bytes_per_request = 1048576
+capture_queue_capacity = 1024
 
 [redaction]
 headers = ["authorization", "cookie", "set-cookie", "x-api-key"]
@@ -30,6 +32,9 @@ path_prefix = "/api/users"
 upstreams = ["http://users-service:3000"]
 timeout_ms = 3000
 retries = 1
+concurrency_limit = 100
+passive_health_failures = 3
+passive_health_cooldown_ms = 10000
 capture_policy = "off"
 
 [[routes]]
@@ -39,6 +44,9 @@ path_prefix = "/api/payments"
 upstreams = ["http://payments-service:4000"]
 timeout_ms = 3000
 retries = 0
+concurrency_limit = 100
+passive_health_failures = 3
+passive_health_cooldown_ms = 10000
 capture_policy = "errors_and_slow"
 slow_threshold_ms = 500
 capture_request_body = true
@@ -51,6 +59,9 @@ path_prefix = "/api/plugin-timeout"
 upstreams = ["http://payments-service:4000"]
 timeout_ms = 3000
 retries = 0
+concurrency_limit = 100
+passive_health_failures = 3
+passive_health_cooldown_ms = 10000
 capture_policy = "off"
 
 [[plugins]]

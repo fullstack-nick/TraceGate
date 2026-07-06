@@ -61,7 +61,7 @@ resource "google_compute_instance" "tracegate" {
 
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y --no-install-recommends docker.io docker-compose ca-certificates curl
+    apt-get install -y --no-install-recommends docker.io docker-compose ca-certificates curl openssl
     systemctl enable --now docker
     mkdir -p /opt/tracegate
 

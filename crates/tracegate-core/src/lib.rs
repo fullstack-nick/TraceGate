@@ -30,13 +30,61 @@ pub enum CoreError {
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
+    pub mode: RuntimeMode,
     pub listen: SocketAddr,
     pub admin_listen: SocketAddr,
+    pub server_tls: TlsConfig,
+    pub admin: AdminConfig,
+    pub upstream_tls: UpstreamTlsConfig,
     pub storage: StorageConfig,
     pub redaction: RedactionConfig,
     pub observability: ObservabilityConfig,
     pub routes: Vec<Route>,
     pub plugins: Vec<PluginConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeMode {
+    Demo,
+    Production,
+}
+
+impl RuntimeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Demo => "demo",
+            Self::Production => "production",
+        }
+    }
+
+    pub fn is_production(self) -> bool {
+        matches!(self, Self::Production)
+    }
+}
+
+impl fmt::Display for RuntimeMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TlsConfig {
+    pub enabled: bool,
+    pub cert_path: Option<PathBuf>,
+    pub key_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AdminConfig {
+    pub token_env: Option<String>,
+    pub token: Option<String>,
+    pub allow_internal_network: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UpstreamTlsConfig {
+    pub ca_cert_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +103,7 @@ pub struct StorageConfig {
     pub retention_days: u32,
     pub max_total_capture_bytes: u64,
     pub max_capture_bytes_per_request: u64,
+    pub capture_queue_capacity: usize,
 }
 
 impl Default for StorageConfig {
@@ -65,6 +114,7 @@ impl Default for StorageConfig {
             retention_days: 7,
             max_total_capture_bytes: 1_073_741_824,
             max_capture_bytes_per_request: 1_048_576,
+            capture_queue_capacity: 1024,
         }
     }
 }
@@ -203,6 +253,29 @@ impl Default for CaptureConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct RouteOptions {
+    pub timeout: Duration,
+    pub retries: u32,
+    pub capture: CaptureConfig,
+    pub concurrency_limit: usize,
+    pub passive_health_failures: u32,
+    pub passive_health_cooldown: Duration,
+}
+
+impl Default for RouteOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(5),
+            retries: 0,
+            capture: CaptureConfig::default(),
+            concurrency_limit: 100,
+            passive_health_failures: 3,
+            passive_health_cooldown: Duration::from_secs(10),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Route {
     pub id: String,
     pub hosts: Vec<String>,
@@ -211,6 +284,9 @@ pub struct Route {
     pub timeout: Duration,
     pub retries: u32,
     pub capture: CaptureConfig,
+    pub concurrency_limit: usize,
+    pub passive_health_failures: u32,
+    pub passive_health_cooldown: Duration,
     next_upstream: Arc<AtomicUsize>,
 }
 
@@ -223,34 +299,37 @@ impl Route {
         timeout: Duration,
         retries: u32,
     ) -> Self {
-        Self::new_with_capture(
+        Self::new_with_options(
             id,
             hosts,
             path_prefix,
             upstreams,
-            timeout,
-            retries,
-            CaptureConfig::default(),
+            RouteOptions {
+                timeout,
+                retries,
+                ..RouteOptions::default()
+            },
         )
     }
 
-    pub fn new_with_capture(
+    pub fn new_with_options(
         id: impl Into<String>,
         hosts: Vec<String>,
         path_prefix: impl Into<String>,
         upstreams: Vec<Upstream>,
-        timeout: Duration,
-        retries: u32,
-        capture: CaptureConfig,
+        options: RouteOptions,
     ) -> Self {
         Self {
             id: id.into(),
             hosts,
             path_prefix: path_prefix.into(),
             upstreams,
-            timeout,
-            retries,
-            capture,
+            timeout: options.timeout,
+            retries: options.retries,
+            capture: options.capture,
+            concurrency_limit: options.concurrency_limit,
+            passive_health_failures: options.passive_health_failures,
+            passive_health_cooldown: options.passive_health_cooldown,
             next_upstream: Arc::new(AtomicUsize::new(0)),
         }
     }

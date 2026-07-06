@@ -708,7 +708,7 @@ Done when:
 
 ### v0.6 Production Storage and Hardening
 
-Deliver:
+Delivered scope:
 
 - PostgreSQL migrations and repository implementation.
 - Production config mode.
@@ -721,14 +721,15 @@ Deliver:
 - Capture writer backpressure.
 - Production readiness validation.
 - GCP production-mode config and TLS deployment on the VM.
+- Production Compose keeps Postgres, admin, telemetry, and replay target internal to the VM network.
 
 Done when:
 
 - Same integration test suite passes against SQLite and PostgreSQL.
 - Gateway refuses production mode without admin token, retention caps, and plugin limits.
 - TLS smoke test passes.
-- Hot reload updates routes without dropping in-flight requests.
-- Backpressure test proves capture drops are recorded without breaking proxy traffic.
+- Hot reload updates route/plugin/redaction/capture state without dropping in-flight requests.
+- Backpressure proof shows capture drops are recorded without breaking proxy traffic.
 - Live GCP production-mode deployment refuses unsafe config and accepts the valid deployed config.
 - SSH inspection verifies TLS listener, admin token enforcement, hot reload activation, and capture backpressure logs.
 

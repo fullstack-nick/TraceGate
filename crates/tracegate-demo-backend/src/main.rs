@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, str::FromStr};
+use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
 use axum::{
     Json, Router,
@@ -7,6 +7,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     routing::any,
 };
+use axum_server::tls_rustls::RustlsConfig;
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use tokio::net::TcpListener;
@@ -18,6 +19,10 @@ struct Cli {
     service: ServiceKind,
     #[arg(long)]
     listen: String,
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -54,6 +59,8 @@ struct DemoResponse {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -71,9 +78,20 @@ async fn main() -> anyhow::Result<()> {
         .route("/{*path}", any(handler))
         .with_state(state);
 
-    tracing::info!(listen = %listen, "starting demo backend");
-    let listener = TcpListener::bind(listen).await?;
-    axum::serve(listener, app).await?;
+    tracing::info!(listen = %listen, tls = cli.tls_cert.is_some(), "starting demo backend");
+    match (cli.tls_cert, cli.tls_key) {
+        (Some(cert), Some(key)) => {
+            let tls = RustlsConfig::from_pem_file(cert, key).await?;
+            axum_server::bind_rustls(listen, tls)
+                .serve(app.into_make_service())
+                .await?;
+        }
+        (None, None) => {
+            let listener = TcpListener::bind(listen).await?;
+            axum::serve(listener, app).await?;
+        }
+        _ => anyhow::bail!("--tls-cert and --tls-key must be provided together"),
+    }
     Ok(())
 }
 

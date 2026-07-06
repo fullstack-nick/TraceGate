@@ -18,8 +18,9 @@ use axum::{
 };
 use tokio::{net::TcpListener, sync::oneshot};
 use tracegate_core::{
-    AppConfig, CaptureConfig, CapturePolicy, ObservabilityConfig, PluginConfig, PluginConfigValue,
-    PluginHook, RedactionConfig, Route, StorageConfig, Upstream,
+    AdminConfig, AppConfig, CaptureConfig, CapturePolicy, ObservabilityConfig, PluginConfig,
+    PluginConfigValue, PluginHook, RedactionConfig, Route, RouteOptions, RuntimeMode,
+    StorageConfig, TlsConfig, Upstream, UpstreamTlsConfig,
 };
 use tracegate_observability::{Telemetry, trace_id_hex_from_traceparent};
 use tracegate_proxy::{serve_listener, serve_listeners};
@@ -228,6 +229,35 @@ async fn start_proxy_with_admin(route: Route) -> (SocketAddr, SocketAddr, onesho
     (addr, admin_addr, shutdown_tx)
 }
 
+async fn start_proxy_with_admin_token(
+    route: Route,
+    token: &str,
+) -> (SocketAddr, SocketAddr, oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_addr = admin_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    let mut config = app_config(addr, admin_addr, vec![route]);
+    config.admin = AdminConfig {
+        token_env: Some("TRACEGATE_TEST_ADMIN_TOKEN".to_owned()),
+        token: Some(token.to_owned()),
+        allow_internal_network: false,
+    };
+    let telemetry = Telemetry::new(&config.observability);
+
+    tokio::spawn(async move {
+        serve_listeners(listener, admin_listener, config, telemetry, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    (addr, admin_addr, shutdown_tx)
+}
+
 async fn start_broken_backend() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -243,8 +273,12 @@ async fn start_broken_backend() -> SocketAddr {
 
 fn app_config(listen: SocketAddr, admin_listen: SocketAddr, routes: Vec<Route>) -> AppConfig {
     AppConfig {
+        mode: RuntimeMode::Demo,
         listen,
         admin_listen,
+        server_tls: TlsConfig::default(),
+        admin: AdminConfig::default(),
+        upstream_tls: UpstreamTlsConfig::default(),
         storage: storage_config(),
         redaction: RedactionConfig::default(),
         observability: ObservabilityConfig {
@@ -311,14 +345,33 @@ fn route_to_with_capture(
     timeout: Duration,
     capture: CaptureConfig,
 ) -> Route {
-    Route::new_with_capture(
+    Route::new_with_options(
         "test",
         vec!["*".to_owned()],
         path_prefix,
         vec![Upstream::parse(&format!("http://{addr}")).unwrap()],
-        timeout,
-        0,
-        capture,
+        RouteOptions {
+            timeout,
+            capture,
+            ..RouteOptions::default()
+        },
+    )
+}
+
+fn route_to_many_with_options(
+    addrs: Vec<SocketAddr>,
+    path_prefix: &str,
+    options: RouteOptions,
+) -> Route {
+    Route::new_with_options(
+        "test",
+        vec!["*".to_owned()],
+        path_prefix,
+        addrs
+            .into_iter()
+            .map(|addr| Upstream::parse(&format!("http://{addr}")).unwrap())
+            .collect(),
+        options,
     )
 }
 
@@ -534,6 +587,35 @@ async fn admin_health_and_metrics_endpoints_respond() {
     assert!(metrics.contains("tracegate_requests_total"));
     assert!(metrics.contains("tracegate_request_duration_seconds"));
     assert!(metrics.contains("route_id=\"test\""));
+
+    let _ = proxy_shutdown.send(());
+    let _ = backend_shutdown.send(());
+}
+
+#[tokio::test]
+async fn admin_endpoints_require_bearer_token_when_configured() {
+    let (backend_addr, backend_shutdown) = start_backend(StatusCode::OK, "users", None).await;
+    let (_proxy_addr, admin_addr, proxy_shutdown) = start_proxy_with_admin_token(
+        route_to(backend_addr, "/api/users", Duration::from_secs(1), 0),
+        "admin-secret",
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let unauthorized = client
+        .get(format!("http://{admin_addr}/health/live"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let authorized = client
+        .get(format!("http://{admin_addr}/health/live"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
 
     let _ = proxy_shutdown.send(());
     let _ = backend_shutdown.send(());
@@ -856,6 +938,49 @@ async fn returns_504_for_timeout() {
 }
 
 #[tokio::test]
+async fn returns_503_when_route_concurrency_is_saturated() {
+    let (backend_addr, backend_shutdown) =
+        start_backend(StatusCode::OK, "slow", Some(Duration::from_millis(250))).await;
+    let route = route_to_many_with_options(
+        vec![backend_addr],
+        "/api/slow",
+        RouteOptions {
+            timeout: Duration::from_secs(1),
+            concurrency_limit: 1,
+            ..RouteOptions::default()
+        },
+    );
+    let (proxy_addr, proxy_shutdown) = start_proxy(route).await;
+
+    let client = reqwest::Client::new();
+    let first = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .get(format!("http://{proxy_addr}/api/slow/first"))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let second = client
+        .get(format!("http://{proxy_addr}/api/slow/second"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(second.headers().get("x-request-id").is_some());
+
+    let first = first.await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let _ = proxy_shutdown.send(());
+    let _ = backend_shutdown.send(());
+}
+
+#[tokio::test]
 async fn returns_502_for_unavailable_upstream() {
     let unavailable_addr = start_broken_backend().await;
 
@@ -875,4 +1000,46 @@ async fn returns_502_for_unavailable_upstream() {
     assert!(response.headers().get("x-request-id").is_some());
 
     let _ = proxy_shutdown.send(());
+}
+
+#[tokio::test]
+async fn passive_health_skips_failed_upstream_until_cooldown() {
+    let unavailable_addr = start_broken_backend().await;
+    let (healthy_addr, healthy_shutdown) = start_backend(StatusCode::OK, "users", None).await;
+    let route = route_to_many_with_options(
+        vec![unavailable_addr, healthy_addr],
+        "/api/users",
+        RouteOptions {
+            timeout: Duration::from_millis(100),
+            passive_health_failures: 1,
+            passive_health_cooldown: Duration::from_secs(30),
+            ..RouteOptions::default()
+        },
+    );
+    let (proxy_addr, proxy_shutdown) = start_proxy(route).await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .get(format!("http://{proxy_addr}/api/users/first"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+
+    let second = client
+        .get(format!("http://{proxy_addr}/api/users/second"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+
+    let third = client
+        .get(format!("http://{proxy_addr}/api/users/third"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(third.status(), StatusCode::OK);
+
+    let _ = proxy_shutdown.send(());
+    let _ = healthy_shutdown.send(());
 }

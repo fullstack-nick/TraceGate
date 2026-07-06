@@ -1,8 +1,8 @@
 # TraceGate
 
-TraceGate is a Rust observability API gateway that routes HTTP traffic and is being built toward failure capture, replay, and sandboxed request-policy plugins.
+TraceGate is a Rust observability API gateway that routes HTTP traffic, records failure evidence, replays captured requests, and runs sandboxed request-policy plugins.
 
-v0.5 provides the gateway foundation, observability, a SQLite capture store, safe replay, and a sandboxed WASM `before_request` policy hook:
+v0.6 provides the gateway foundation, observability, SQLite demo storage, PostgreSQL production storage, safe replay, a sandboxed WASM `before_request` policy hook, and production-mode hardening:
 
 - host and path-prefix routing
 - Hyper-based reverse proxying
@@ -11,7 +11,8 @@ v0.5 provides the gateway foundation, observability, a SQLite capture store, saf
 - W3C `traceparent` propagation
 - OpenTelemetry OTLP trace export
 - Prometheus metrics on the admin listener
-- SQLite request metadata and bounded capture storage
+- SQLite request metadata and bounded capture storage in demo mode
+- PostgreSQL request metadata and bounded capture storage in production mode
 - redacted header/query storage for captured requests
 - `tracegate requests list` and `tracegate requests show`
 - `tracegate replay --id` and `tracegate replay --last-failed`
@@ -23,9 +24,13 @@ v0.5 provides the gateway foundation, observability, a SQLite capture store, saf
 - bundled `api-key-guard` and `header-normalizer` example plugins
 - `tracegate storage migrate`, `prune`, and `backup`
 - `/health/live` and `/health/ready`
-- per-route timeouts and retry configuration
+- bearer-authenticated admin endpoints when an admin token is configured
+- `POST /admin/reload` for atomic route/plugin/redaction/capture hot reloads
+- rustls data-plane TLS and HTTPS upstream verification in production mode
+- per-route timeouts, retry configuration, concurrency limits, and passive upstream health
+- bounded capture persistence with drop accounting under backpressure
 - local Docker Compose demo with users, payments, a safe replay target, OpenTelemetry Collector, Jaeger, and Prometheus
-- Terraform and SSH-based GCP Compute Engine deployment assets
+- Terraform and SSH-based GCP Compute Engine deployment assets with production-mode HTTPS/PostgreSQL Compose
 
 ## Local Demo
 
@@ -72,6 +77,10 @@ Expected behavior:
 scripts/cargo.ps1 fmt --check
 scripts/cargo.ps1 clippy --workspace --all-targets -- -D warnings
 scripts/cargo.ps1 test --workspace
+
+docker run -d --name tracegate-postgres-test -p 55432:5432 -e POSTGRES_USER=tracegate -e POSTGRES_PASSWORD=tracegate -e POSTGRES_DB=tracegate_test postgres:16-alpine
+$env:TRACEGATE_TEST_POSTGRES_URL='postgres://tracegate:tracegate@localhost:55432/tracegate_test'
+scripts/cargo.ps1 test -p tracegate-storage
 ```
 
 ## GCP Deployment
@@ -81,8 +90,9 @@ The live deployment path is intentionally direct-control:
 - dedicated TraceGate GCP project
 - Terraform-managed `e2-micro` Compute Engine VM in `us-central1-a`
 - Docker Compose under systemd with TraceGate, demo backends, a safe internal replay target, OpenTelemetry Collector, Jaeger, and Prometheus
+- production mode uses HTTPS on the public TraceGate listener, internal PostgreSQL, generated private CA material, HTTPS demo upstreams, and bearer-authenticated admin inspection over the VM Docker network
 - local image build, `docker save`, `gcloud compute scp`, VM-side `docker load`
-- live `curl` smoke plus SSH telemetry/log inspection
+- live HTTPS `curl --cacert` smoke plus SSH telemetry/log/storage inspection
 
 Scripts live under `deployments/gcp/scripts`.
 
@@ -98,4 +108,4 @@ deployments/gcp/scripts/inspect-observability.ps1
 deployments/gcp/scripts/logs.ps1
 ```
 
-The guard script refuses to deploy unless the active account is `nickaccturk@gmail.com` and the active project is a dedicated `tracegate-*` project. Only TraceGate's public HTTP port `8080` is exposed by Terraform; telemetry services and the replay target are inspected over SSH inside the VM.
+The guard script refuses to deploy unless the active account is `nickaccturk@gmail.com` and the active project is a dedicated `tracegate-*` project. Only TraceGate's public data-plane port `8080` is exposed by Terraform; production traffic on that port is HTTPS. Admin, PostgreSQL, telemetry services, and the replay target are inspected over SSH inside the VM.

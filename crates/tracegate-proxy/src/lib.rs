@@ -1,38 +1,52 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     convert::Infallible,
+    fs::File,
     future::Future,
+    io::BufReader,
     net::SocketAddr,
+    path::PathBuf,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use http::{
     HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
     header::{
-        CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, PROXY_AUTHENTICATE,
-        PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
+        AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName,
+        PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
     },
 };
 use http_body::{Body, Frame};
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::{body::Incoming, service::service_fn};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ServerBuilder,
 };
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::{net::TcpListener, time::timeout};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc},
+    time::timeout,
+};
+use tokio_rustls::TlsAcceptor;
 use tracegate_core::{
-    AppConfig, CapturePolicy, FORWARDED_FOR_HEADER, FORWARDED_HOST_HEADER, FORWARDED_PROTO_HEADER,
-    RedactionConfig, Route, Router, StorageConfig, Upstream, request_id_from_headers,
-    request_id_header_value,
+    AdminConfig, AppConfig, CapturePolicy, FORWARDED_FOR_HEADER, FORWARDED_HOST_HEADER,
+    FORWARDED_PROTO_HEADER, RedactionConfig, Route, Router, StorageConfig, TlsConfig, Upstream,
+    request_id_from_headers, request_id_header_value,
 };
 use tracegate_observability::{PluginDecisionMetric, RequestMetric, Telemetry};
 use tracegate_storage::{
@@ -46,7 +60,8 @@ use tracegate_wasm::{
 use tracing::{Instrument, field};
 
 type ProxyBody = BoxBody<Bytes, hyper::Error>;
-type ProxyClient = Client<HttpConnector, ProxyBody>;
+type ProxyConnector = HttpsConnector<HttpConnector>;
+type ProxyClient = Client<ProxyConnector, ProxyBody>;
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -56,17 +71,122 @@ pub enum ProxyError {
     Storage(#[from] tracegate_storage::StorageError),
     #[error("policy engine error: {0}")]
     Policy(#[from] tracegate_wasm::PolicyError),
+    #[error("TLS error: {0}")]
+    Tls(String),
 }
 
 #[derive(Clone)]
 struct Proxy {
-    router: Arc<Router>,
+    state: Arc<ArcSwap<GatewayState>>,
     client: ProxyClient,
     telemetry: Telemetry,
-    storage: Arc<Storage>,
+    capture_writer: CaptureWriter,
+}
+
+struct RequestContext {
+    remote_addr: SocketAddr,
+    request_id: String,
+    trace_id: Option<String>,
+    method: Method,
+    redacted_path: String,
+    state: Arc<GatewayState>,
+}
+
+struct GatewayState {
+    router: Router,
     storage_config: StorageConfig,
     redaction: RedactionConfig,
-    policy: Arc<PolicyEngine>,
+    policy: PolicyEngine,
+    route_runtime: HashMap<String, Arc<RouteRuntime>>,
+}
+
+struct RouteRuntime {
+    semaphore: Arc<Semaphore>,
+    upstreams: Vec<UpstreamRuntime>,
+    next_upstream: AtomicUsize,
+    failure_threshold: u32,
+    cooldown_ms: i64,
+}
+
+struct UpstreamRuntime {
+    failures: AtomicU32,
+    unhealthy_until_ms: AtomicI64,
+}
+
+impl GatewayState {
+    fn new(config: &AppConfig) -> Result<Self, ProxyError> {
+        let mut route_runtime = HashMap::new();
+        for route in &config.routes {
+            route_runtime.insert(route.id.clone(), Arc::new(RouteRuntime::new(route)));
+        }
+        Ok(Self {
+            router: Router::new(config.routes.clone()),
+            storage_config: config.storage.clone(),
+            redaction: config.redaction.clone(),
+            policy: PolicyEngine::new(&config.plugins)?,
+            route_runtime,
+        })
+    }
+
+    fn runtime_for(&self, route: &Route) -> Option<Arc<RouteRuntime>> {
+        self.route_runtime.get(&route.id).cloned()
+    }
+}
+
+impl RouteRuntime {
+    fn new(route: &Route) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(route.concurrency_limit)),
+            upstreams: route
+                .upstreams
+                .iter()
+                .map(|_| UpstreamRuntime {
+                    failures: AtomicU32::new(0),
+                    unhealthy_until_ms: AtomicI64::new(0),
+                })
+                .collect(),
+            next_upstream: AtomicUsize::new(0),
+            failure_threshold: route.passive_health_failures,
+            cooldown_ms: route
+                .passive_health_cooldown
+                .as_millis()
+                .min(i64::MAX as u128) as i64,
+        }
+    }
+
+    fn select_upstream(&self, route: &Route) -> Option<(usize, Upstream)> {
+        let len = route.upstreams.len();
+        if len == 0 {
+            return None;
+        }
+        let now = now_ms();
+        for _ in 0..len {
+            let index = self.next_upstream.fetch_add(1, Ordering::Relaxed) % len;
+            let runtime = &self.upstreams[index];
+            if runtime.unhealthy_until_ms.load(Ordering::Relaxed) <= now {
+                return Some((index, route.upstreams[index].clone()));
+            }
+        }
+        None
+    }
+
+    fn record_upstream_result(&self, index: usize, failed: bool) {
+        let Some(runtime) = self.upstreams.get(index) else {
+            return;
+        };
+        if failed {
+            let failures = runtime.failures.fetch_add(1, Ordering::Relaxed) + 1;
+            if failures >= self.failure_threshold {
+                runtime
+                    .unhealthy_until_ms
+                    .store(now_ms().saturating_add(self.cooldown_ms), Ordering::Relaxed);
+                runtime.failures.store(0, Ordering::Relaxed);
+            }
+        } else {
+            runtime.failures.store(0, Ordering::Relaxed);
+            runtime.unhealthy_until_ms.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -75,6 +195,28 @@ struct RequestTemplate {
     uri: Uri,
     version: Version,
     headers: HeaderMap,
+}
+
+#[derive(Clone)]
+struct CaptureWriter {
+    sender: mpsc::Sender<CaptureWrite>,
+}
+
+struct CaptureWrite {
+    record: RequestInsert,
+    request_headers: Vec<StoredHeader>,
+    response_headers: Vec<StoredHeader>,
+    capture: Option<CaptureInsert>,
+    plugin_decisions: Vec<PluginDecisionInsert>,
+}
+
+#[derive(Clone)]
+struct AdminState {
+    telemetry: Telemetry,
+    storage: Arc<Storage>,
+    gateway_state: Arc<ArcSwap<GatewayState>>,
+    config_path: Option<PathBuf>,
+    current_config: Arc<RwLock<AppConfig>>,
 }
 
 #[derive(Debug)]
@@ -113,13 +255,30 @@ impl RequestLogRecord {
 }
 
 pub async fn serve(config: AppConfig, telemetry: Telemetry) -> Result<(), ProxyError> {
+    serve_with_optional_config_path(config, telemetry, None).await
+}
+
+pub async fn serve_with_config_path(
+    config_path: PathBuf,
+    config: AppConfig,
+    telemetry: Telemetry,
+) -> Result<(), ProxyError> {
+    serve_with_optional_config_path(config, telemetry, Some(config_path)).await
+}
+
+async fn serve_with_optional_config_path(
+    config: AppConfig,
+    telemetry: Telemetry,
+    config_path: Option<PathBuf>,
+) -> Result<(), ProxyError> {
     let listener = TcpListener::bind(config.listen).await?;
     let admin_listener = TcpListener::bind(config.admin_listen).await?;
-    serve_listeners(
+    serve_listeners_with_config_path(
         listener,
         admin_listener,
         config,
         telemetry,
+        config_path,
         std::future::pending::<()>(),
     )
     .await
@@ -135,7 +294,8 @@ where
     S: Future<Output = ()> + Send,
 {
     let admin_listener = TcpListener::bind(config.admin_listen).await?;
-    serve_listeners(listener, admin_listener, config, telemetry, shutdown).await
+    serve_listeners_with_config_path(listener, admin_listener, config, telemetry, None, shutdown)
+        .await
 }
 
 pub async fn serve_listeners<S>(
@@ -148,8 +308,36 @@ pub async fn serve_listeners<S>(
 where
     S: Future<Output = ()> + Send,
 {
+    serve_listeners_with_config_path(listener, admin_listener, config, telemetry, None, shutdown)
+        .await
+}
+
+async fn serve_listeners_with_config_path<S>(
+    listener: TcpListener,
+    admin_listener: TcpListener,
+    config: AppConfig,
+    telemetry: Telemetry,
+    config_path: Option<PathBuf>,
+    shutdown: S,
+) -> Result<(), ProxyError>
+where
+    S: Future<Output = ()> + Send,
+{
     let storage = initialize_storage(&config, &telemetry).await?;
-    let proxy = Proxy::new(config, telemetry.clone(), storage.clone())?;
+    let capture_writer = CaptureWriter::spawn(
+        storage.clone(),
+        telemetry.clone(),
+        config.storage.capture_queue_capacity,
+    );
+    let proxy = Proxy::new(config.clone(), telemetry.clone(), capture_writer.clone())?;
+    let admin_state = AdminState {
+        telemetry: telemetry.clone(),
+        storage: storage.clone(),
+        gateway_state: proxy.state.clone(),
+        config_path,
+        current_config: Arc::new(RwLock::new(config.clone())),
+    };
+    let tls_acceptor = tls_acceptor(&config.server_tls)?;
     spawn_retention_loop(storage, telemetry.clone());
     tokio::pin!(shutdown);
 
@@ -161,30 +349,18 @@ where
             accepted = listener.accept() => {
                 let (stream, remote_addr) = accepted?;
                 let proxy = proxy.clone();
+                let tls_acceptor = tls_acceptor.clone();
                 tokio::spawn(async move {
-                    let service = service_fn(move |request| {
-                        let proxy = proxy.clone();
-                        async move { proxy.handle(request, remote_addr).await }
-                    });
-
-                    let io = TokioIo::new(stream);
-                    if let Err(err) = ServerBuilder::new(TokioExecutor::new())
-                        .serve_connection_with_upgrades(io, service)
-                        .await
-                    {
-                        tracing::warn!(error = %err, "connection failed");
-                    }
+                    serve_proxy_stream(stream, remote_addr, proxy, tls_acceptor).await;
                 });
             }
             accepted = admin_listener.accept() => {
                 let (stream, _) = accepted?;
-                let telemetry = telemetry.clone();
-                let storage = proxy.storage.clone();
+                let admin_state = admin_state.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |request| {
-                        let telemetry = telemetry.clone();
-                        let storage = storage.clone();
-                        async move { handle_admin_request(request, telemetry, storage).await }
+                        let admin_state = admin_state.clone();
+                        async move { handle_admin_request(request, admin_state).await }
                     });
 
                     let io = TokioIo::new(stream);
@@ -206,23 +382,16 @@ impl Proxy {
     fn new(
         config: AppConfig,
         telemetry: Telemetry,
-        storage: Arc<Storage>,
+        capture_writer: CaptureWriter,
     ) -> Result<Self, ProxyError> {
-        let mut connector = HttpConnector::new();
-        connector.enforce_http(true);
-        let client = Client::builder(TokioExecutor::new()).build(connector);
-        let storage_config = config.storage;
-        let redaction = config.redaction;
-        let policy = Arc::new(PolicyEngine::new(&config.plugins)?);
+        let client = build_upstream_client(&config)?;
+        let state = Arc::new(ArcSwap::from_pointee(GatewayState::new(&config)?));
 
         Ok(Self {
-            router: Arc::new(Router::new(config.routes)),
+            state,
             client,
             telemetry,
-            storage,
-            storage_config,
-            redaction,
-            policy,
+            capture_writer,
         })
     }
 
@@ -239,7 +408,8 @@ impl Proxy {
             .and_then(|value| value.to_str().ok())
             .and_then(tracegate_observability::trace_id_hex_from_traceparent)
             .map(str::to_owned);
-        let path = redacted_path_and_query(request.uri(), &self.redaction);
+        let state = self.state.load_full();
+        let path = redacted_path_and_query(request.uri(), &state.redaction);
         let parent = tracegate_observability::extract_context(request.headers());
         let span = tracing::info_span!(
             "tracegate.request",
@@ -255,31 +425,45 @@ impl Proxy {
         );
         tracegate_observability::set_span_parent(&span, parent);
 
-        self.handle_instrumented(request, remote_addr, request_id, trace_id, method, path)
-            .instrument(span)
-            .await
+        self.handle_instrumented(
+            request,
+            RequestContext {
+                remote_addr,
+                request_id,
+                trace_id,
+                method,
+                redacted_path: path,
+                state,
+            },
+        )
+        .instrument(span)
+        .await
     }
 
     async fn handle_instrumented(
         &self,
         request: Request<Incoming>,
-        remote_addr: SocketAddr,
-        request_id: String,
-        trace_id: Option<String>,
-        method: Method,
-        redacted_path: String,
+        context: RequestContext,
     ) -> Result<Response<ProxyBody>, Infallible> {
+        let RequestContext {
+            remote_addr,
+            request_id,
+            trace_id,
+            method,
+            redacted_path,
+            state,
+        } = context;
         let started = Instant::now();
-        let request_headers_for_storage = stored_headers(request.headers(), &self.redaction);
+        let request_headers_for_storage = stored_headers(request.headers(), &state.redaction);
         let request_path = request.uri().path().to_owned();
-        let redacted_query = redacted_query(request.uri(), &self.redaction);
+        let redacted_query = redacted_query(request.uri(), &state.redaction);
         let query_hash = request.uri().query().map(sha256_hex);
         let host = request
             .headers()
             .get(HOST)
             .and_then(|value| value.to_str().ok());
 
-        let Some(matched) = self.router.match_route(host, request.uri().path()) else {
+        let Some(matched) = state.router.match_route(host, request.uri().path()) else {
             let response = response_with_request_id(
                 StatusCode::NOT_FOUND,
                 "no route matched request",
@@ -305,7 +489,7 @@ impl Proxy {
                 upstream_error: false,
             });
             let record = RequestInsert {
-                request_id,
+                request_id: request_id.clone(),
                 trace_id,
                 route_id: None,
                 method: method.to_string(),
@@ -333,16 +517,91 @@ impl Proxy {
                     response_capture_enabled: false,
                     response_capture_limit: 0,
                     plugin_decisions: Vec::new(),
+                    permit: None,
                 },
             ));
         };
 
         let route_id = matched.route.id.clone();
+        let Some(route_runtime) = state.runtime_for(&matched.route) else {
+            let response = response_with_request_id(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "route runtime unavailable",
+                &request_id,
+            );
+            return Ok(response);
+        };
+        let mut permit = match route_runtime.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                let response = response_with_request_id(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "route concurrency limit reached",
+                    &request_id,
+                );
+                let status = response.status();
+                self.log_request(RequestLogRecord {
+                    request_id: request_id.clone(),
+                    method: method.to_string(),
+                    path: redacted_path.clone(),
+                    route_id: Some(route_id.clone()),
+                    upstream: None,
+                    status: status.as_u16(),
+                    latency_ms: started.elapsed().as_millis(),
+                    error: Some("concurrency_limit".to_owned()),
+                });
+                record_span_fields(
+                    Some(&route_id),
+                    None,
+                    status,
+                    started,
+                    Some("concurrency_limit"),
+                );
+                self.telemetry.record_request(RequestMetric {
+                    route_id: Some(route_id.clone()),
+                    method: method.to_string(),
+                    status: status.as_u16(),
+                    latency_seconds: started.elapsed().as_secs_f64(),
+                    upstream_error: true,
+                });
+                let record = RequestInsert {
+                    request_id,
+                    trace_id,
+                    route_id: Some(route_id),
+                    method: method.to_string(),
+                    path: request_path,
+                    redacted_query,
+                    query_hash,
+                    status: status.as_u16(),
+                    latency_ms: started.elapsed().as_millis(),
+                    upstream: None,
+                    is_error: true,
+                    is_slow: false,
+                    capture_policy: matched.route.capture.policy.to_string(),
+                    capture_dropped: true,
+                    created_at_ms: now_ms(),
+                };
+                return Ok(self.attach_storage_finalizer(
+                    response,
+                    StorageFinalizerInput {
+                        record,
+                        request_headers: request_headers_for_storage,
+                        request_capture: Arc::new(Mutex::new(CaptureBuffer::disabled())),
+                        should_capture: false,
+                        request_content_type: None,
+                        response_capture_enabled: false,
+                        response_capture_limit: 0,
+                        plugin_decisions: Vec::new(),
+                        permit: None,
+                    },
+                ));
+            }
+        };
         let request_content_type = content_type(request.headers());
         let retry_eligible = retry_eligible(&method, request.headers());
         let mut template_headers = request.headers().clone();
         let policy_headers = policy_headers(request.headers());
-        let policy_preview_limit = self.policy.max_body_preview_bytes(&route_id);
+        let policy_preview_limit = state.policy.max_body_preview_bytes(&route_id);
         let (request_parts, request_body) = request.into_parts();
         let mut request_body = request_body.boxed();
         let body_preview = if policy_preview_limit > 0 {
@@ -406,6 +665,7 @@ impl Proxy {
                             response_capture_enabled: false,
                             response_capture_limit: 0,
                             plugin_decisions: Vec::new(),
+                            permit: permit.take(),
                         },
                     ));
                 }
@@ -414,7 +674,7 @@ impl Proxy {
             None
         };
 
-        let policy_evaluation = self
+        let policy_evaluation = state
             .policy
             .evaluate(PolicyRequest {
                 route_id: route_id.clone(),
@@ -423,7 +683,7 @@ impl Proxy {
                 path: request_path.clone(),
                 query: redacted_query.clone(),
                 headers: policy_headers,
-                sensitive_headers: self.redaction.headers.clone(),
+                sensitive_headers: state.redaction.headers.clone(),
                 client_address: remote_addr.to_string(),
                 body_preview,
             })
@@ -490,6 +750,7 @@ impl Proxy {
                         &request_id,
                         &policy_evaluation.records,
                     ),
+                    permit: permit.take(),
                 },
             ));
         }
@@ -499,7 +760,72 @@ impl Proxy {
             &policy_evaluation.set_headers,
             &policy_evaluation.remove_headers,
         );
-        let upstream = matched.route.select_upstream();
+        let Some((upstream_index, upstream)) = route_runtime.select_upstream(&matched.route) else {
+            let response = response_with_request_id(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "all route upstreams are temporarily unhealthy",
+                &request_id,
+            );
+            let status = response.status();
+            self.log_request(RequestLogRecord {
+                request_id: request_id.clone(),
+                method: method.to_string(),
+                path: redacted_path.clone(),
+                route_id: Some(route_id.clone()),
+                upstream: None,
+                status: status.as_u16(),
+                latency_ms: started.elapsed().as_millis(),
+                error: Some("all_upstreams_unhealthy".to_owned()),
+            });
+            record_span_fields(
+                Some(&route_id),
+                None,
+                status,
+                started,
+                Some("all_upstreams_unhealthy"),
+            );
+            self.telemetry.record_request(RequestMetric {
+                route_id: Some(route_id.clone()),
+                method: method.to_string(),
+                status: status.as_u16(),
+                latency_seconds: started.elapsed().as_secs_f64(),
+                upstream_error: true,
+            });
+            let record = RequestInsert {
+                request_id: request_id.clone(),
+                trace_id,
+                route_id: Some(route_id),
+                method: method.to_string(),
+                path: request_path,
+                redacted_query,
+                query_hash,
+                status: status.as_u16(),
+                latency_ms: started.elapsed().as_millis(),
+                upstream: None,
+                is_error: true,
+                is_slow: false,
+                capture_policy: matched.route.capture.policy.to_string(),
+                capture_dropped: true,
+                created_at_ms: now_ms(),
+            };
+            return Ok(self.attach_storage_finalizer(
+                response,
+                StorageFinalizerInput {
+                    record,
+                    request_headers: request_headers_for_storage,
+                    request_capture: Arc::new(Mutex::new(CaptureBuffer::disabled())),
+                    should_capture: false,
+                    request_content_type: None,
+                    response_capture_enabled: false,
+                    response_capture_limit: 0,
+                    plugin_decisions: plugin_decision_inserts(
+                        &request_id,
+                        &policy_evaluation.records,
+                    ),
+                    permit: permit.take(),
+                },
+            ));
+        };
         let upstream_origin = upstream.origin();
         let request_capture_enabled = matched.route.capture.policy != CapturePolicy::Off
             && matched.route.capture.capture_request_body
@@ -509,7 +835,7 @@ impl Proxy {
                 .unwrap_or(false);
         let request_capture = Arc::new(Mutex::new(CaptureBuffer::new(
             request_capture_enabled,
-            self.storage_config.max_capture_bytes_per_request,
+            state.storage_config.max_capture_bytes_per_request,
         )));
         let template = RequestTemplate {
             method,
@@ -569,6 +895,7 @@ impl Proxy {
         };
         let status = response.status();
         let upstream_error = error.is_some() || status.is_server_error();
+        route_runtime.record_upstream_result(upstream_index, upstream_error);
         let is_slow = started.elapsed() >= matched.route.capture.slow_threshold;
         let should_capture = matched
             .route
@@ -612,7 +939,7 @@ impl Proxy {
                 .lock()
                 .expect("request capture poisoned")
                 .captured_len();
-            let remaining = self
+            let remaining = state
                 .storage_config
                 .max_capture_bytes_per_request
                 .saturating_sub(request_captured_len as u64);
@@ -650,6 +977,7 @@ impl Proxy {
                 response_capture_enabled,
                 response_capture_limit,
                 plugin_decisions: plugin_decision_inserts(&request_id, &policy_evaluation.records),
+                permit: permit.take(),
             },
         ))
     }
@@ -736,14 +1064,14 @@ impl Proxy {
         input: StorageFinalizerInput,
     ) -> Response<ProxyBody> {
         let (parts, body) = response.into_parts();
-        let response_headers = stored_headers(&parts.headers, &self.redaction);
+        let response_headers = stored_headers(&parts.headers, &self.state.load().redaction);
         let response_content_type = content_type(&parts.headers);
         let response_capture = Arc::new(Mutex::new(CaptureBuffer::new(
             input.response_capture_enabled,
             input.response_capture_limit,
         )));
         let finalizer = CaptureFinalizer {
-            storage: self.storage.clone(),
+            capture_writer: self.capture_writer.clone(),
             telemetry: self.telemetry.clone(),
             record: Some(input.record),
             request_headers: Some(input.request_headers),
@@ -755,6 +1083,7 @@ impl Proxy {
             response_content_type,
             plugin_decisions: Some(input.plugin_decisions),
             finalized: false,
+            _permit: input.permit,
         };
         let body = CapturingBody::new(body, response_capture, Some(finalizer)).boxed();
 
@@ -828,6 +1157,7 @@ struct StorageFinalizerInput {
     response_capture_enabled: bool,
     response_capture_limit: u64,
     plugin_decisions: Vec<PluginDecisionInsert>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 async fn initialize_storage(
@@ -867,6 +1197,116 @@ fn spawn_retention_loop(storage: Arc<Storage>, telemetry: Telemetry) {
             }
         }
     });
+}
+
+async fn serve_proxy_stream(
+    stream: TcpStream,
+    remote_addr: SocketAddr,
+    proxy: Proxy,
+    tls_acceptor: Option<TlsAcceptor>,
+) {
+    if let Some(acceptor) = tls_acceptor {
+        match acceptor.accept(stream).await {
+            Ok(stream) => {
+                let service = service_fn(move |request| {
+                    let proxy = proxy.clone();
+                    async move { proxy.handle(request, remote_addr).await }
+                });
+                let io = TokioIo::new(stream);
+                if let Err(err) = ServerBuilder::new(TokioExecutor::new())
+                    .serve_connection_with_upgrades(io, service)
+                    .await
+                {
+                    tracing::warn!(error = %err, "TLS connection failed");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "TLS handshake failed");
+            }
+        }
+    } else {
+        let service = service_fn(move |request| {
+            let proxy = proxy.clone();
+            async move { proxy.handle(request, remote_addr).await }
+        });
+        let io = TokioIo::new(stream);
+        if let Err(err) = ServerBuilder::new(TokioExecutor::new())
+            .serve_connection_with_upgrades(io, service)
+            .await
+        {
+            tracing::warn!(error = %err, "connection failed");
+        }
+    }
+}
+
+fn tls_acceptor(config: &TlsConfig) -> Result<Option<TlsAcceptor>, ProxyError> {
+    install_rustls_crypto_provider();
+    if !config.enabled {
+        return Ok(None);
+    }
+    let cert_path = config
+        .cert_path
+        .as_ref()
+        .ok_or_else(|| ProxyError::Tls("server TLS cert_path is missing".to_owned()))?;
+    let key_path = config
+        .key_path
+        .as_ref()
+        .ok_or_else(|| ProxyError::Tls("server TLS key_path is missing".to_owned()))?;
+    let certs = load_certs(cert_path)?;
+    let key = load_private_key(key_path)?;
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|err| ProxyError::Tls(err.to_string()))?;
+    Ok(Some(TlsAcceptor::from(Arc::new(config))))
+}
+
+fn build_upstream_client(config: &AppConfig) -> Result<ProxyClient, ProxyError> {
+    install_rustls_crypto_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(ca_path) = config.upstream_tls.ca_cert_path.as_ref() {
+        for cert in load_certs(ca_path)? {
+            roots
+                .add(cert)
+                .map_err(|err| ProxyError::Tls(format!("invalid upstream CA: {err}")))?;
+        }
+    }
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    Ok(Client::builder(TokioExecutor::new()).build(connector))
+}
+
+fn install_rustls_crypto_provider() {
+    static INSTALL: OnceLock<()> = OnceLock::new();
+    INSTALL.get_or_init(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
+fn load_certs(path: &PathBuf) -> Result<Vec<CertificateDer<'static>>, ProxyError> {
+    let file = File::open(path)
+        .map_err(|err| ProxyError::Tls(format!("failed to open cert {}: {err}", path.display())))?;
+    let mut reader = BufReader::new(file);
+    rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| ProxyError::Tls(format!("failed to read cert {}: {err}", path.display())))
+}
+
+fn load_private_key(path: &PathBuf) -> Result<PrivateKeyDer<'static>, ProxyError> {
+    let file = File::open(path)
+        .map_err(|err| ProxyError::Tls(format!("failed to open key {}: {err}", path.display())))?;
+    let mut reader = BufReader::new(file);
+    rustls_pemfile::private_key(&mut reader)
+        .map_err(|err| ProxyError::Tls(format!("failed to read key {}: {err}", path.display())))?
+        .ok_or_else(|| ProxyError::Tls(format!("no private key found in {}", path.display())))
 }
 
 struct CapturingBody {
@@ -934,7 +1374,7 @@ impl Drop for CapturingBody {
 }
 
 struct CaptureFinalizer {
-    storage: Arc<Storage>,
+    capture_writer: CaptureWriter,
     telemetry: Telemetry,
     record: Option<RequestInsert>,
     request_headers: Option<Vec<StoredHeader>>,
@@ -946,6 +1386,7 @@ struct CaptureFinalizer {
     response_content_type: Option<String>,
     plugin_decisions: Option<Vec<PluginDecisionInsert>>,
     finalized: bool,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl CaptureFinalizer {
@@ -981,32 +1422,71 @@ impl CaptureFinalizer {
             request_body_sha256: request_snapshot.sha256,
             response_body_sha256: response_snapshot.sha256,
         });
-        let wrote_capture = capture.is_some();
-        let storage = self.storage.clone();
-        let telemetry = self.telemetry.clone();
+        self.capture_writer.enqueue(
+            CaptureWrite {
+                record,
+                request_headers,
+                response_headers,
+                capture,
+                plugin_decisions,
+            },
+            &self.telemetry,
+        );
+    }
+}
 
+impl CaptureWriter {
+    fn spawn(storage: Arc<Storage>, telemetry: Telemetry, capacity: usize) -> Self {
+        let (sender, mut receiver) = mpsc::channel::<CaptureWrite>(capacity);
         tokio::spawn(async move {
-            match storage
-                .insert_request(
-                    record,
-                    request_headers,
-                    response_headers,
-                    capture,
-                    plugin_decisions,
-                )
-                .await
-            {
-                Ok(()) => {
-                    if wrote_capture {
-                        telemetry.record_capture();
+            while let Some(write) = receiver.recv().await {
+                let wrote_capture = write.capture.is_some() && !write.record.capture_dropped;
+                match storage
+                    .insert_request(
+                        write.record,
+                        write.request_headers,
+                        write.response_headers,
+                        write.capture,
+                        write.plugin_decisions,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        if wrote_capture {
+                            telemetry.record_capture();
+                        }
                     }
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "failed to persist request capture");
-                    telemetry.record_capture_dropped();
+                    Err(err) => {
+                        tracing::warn!(error = %err, "failed to persist request capture");
+                        telemetry.record_capture_dropped();
+                    }
                 }
             }
         });
+
+        Self { sender }
+    }
+
+    fn enqueue(&self, write: CaptureWrite, telemetry: &Telemetry) {
+        match self.sender.try_send(write) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(mut returned)) => {
+                let had_capture = returned.capture.take().is_some();
+                returned.record.capture_dropped = true;
+                if had_capture {
+                    telemetry.record_capture_dropped();
+                }
+                tracing::warn!("capture writer queue full; recording metadata-only fallback");
+                if let Err(err) = self.sender.try_send(returned) {
+                    tracing::warn!(error = %err, "failed to enqueue metadata-only capture fallback");
+                    telemetry.record_capture_dropped();
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("capture writer queue closed; dropping capture record");
+                telemetry.record_capture_dropped();
+            }
+        }
     }
 }
 
@@ -1305,20 +1785,27 @@ fn build_upstream_request(
 
 async fn handle_admin_request(
     request: Request<Incoming>,
-    telemetry: Telemetry,
-    storage: Arc<Storage>,
+    admin_state: AdminState,
 ) -> Result<Response<ProxyBody>, Infallible> {
+    let admin = {
+        let config = admin_state.current_config.read().await;
+        config.admin.clone()
+    };
+    if !admin_authorized(&request, &admin) {
+        return Ok(text_response(StatusCode::UNAUTHORIZED, "unauthorized\n"));
+    }
+
     let response = match (request.method(), request.uri().path()) {
         (&Method::GET, "/health/live") => text_response(StatusCode::OK, "live\n"),
-        (&Method::GET, "/health/ready") => match storage.health_check().await {
+        (&Method::GET, "/health/ready") => match admin_state.storage.health_check().await {
             Ok(()) => text_response(StatusCode::OK, "ready\n"),
             Err(err) => text_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &format!("storage not ready: {err}\n"),
             ),
         },
-        (&Method::GET, "/metrics") if telemetry.prometheus_enabled() => {
-            match telemetry.render_prometheus() {
+        (&Method::GET, "/metrics") if admin_state.telemetry.prometheus_enabled() => {
+            match admin_state.telemetry.render_prometheus() {
                 Ok(metrics) => response_with_content_type(
                     StatusCode::OK,
                     "application/openmetrics-text; version=1.0.0; charset=utf-8",
@@ -1331,10 +1818,109 @@ async fn handle_admin_request(
             }
         }
         (&Method::GET, "/metrics") => text_response(StatusCode::NOT_FOUND, "metrics disabled\n"),
+        (&Method::POST, "/admin/reload") => reload_gateway(admin_state).await,
         _ => text_response(StatusCode::NOT_FOUND, "not found\n"),
     };
 
     Ok(response)
+}
+
+fn admin_authorized(request: &Request<Incoming>, admin: &AdminConfig) -> bool {
+    let Some(token) = admin.token.as_deref() else {
+        return request.uri().path() != "/admin/reload";
+    };
+    let Some(header) = request.headers().get(AUTHORIZATION) else {
+        return false;
+    };
+    let Ok(value) = header.to_str() else {
+        return false;
+    };
+    value == format!("Bearer {token}")
+}
+
+async fn reload_gateway(admin_state: AdminState) -> Response<ProxyBody> {
+    let Some(path) = admin_state.config_path.clone() else {
+        return text_response(StatusCode::BAD_REQUEST, "reload config path unavailable\n");
+    };
+    let new_config = match tracegate_config::load_config(&path) {
+        Ok(config) => config,
+        Err(err) => {
+            return response_with_content_type(
+                StatusCode::BAD_REQUEST,
+                "application/json",
+                format!(
+                    r#"{{"status":"rejected","error":"{}"}}"#,
+                    json_escape(&err.to_string())
+                ),
+            );
+        }
+    };
+
+    let mut current = admin_state.current_config.write().await;
+    if let Err(err) = validate_reload_immutables(&current, &new_config) {
+        return response_with_content_type(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            format!(r#"{{"status":"rejected","error":"{}"}}"#, json_escape(&err)),
+        );
+    }
+    let new_state = match GatewayState::new(&new_config) {
+        Ok(state) => state,
+        Err(err) => {
+            return response_with_content_type(
+                StatusCode::BAD_REQUEST,
+                "application/json",
+                format!(
+                    r#"{{"status":"rejected","error":"{}"}}"#,
+                    json_escape(&err.to_string())
+                ),
+            );
+        }
+    };
+    let routes = new_config.routes.len();
+    let plugins = new_config.plugins.len();
+    admin_state.gateway_state.store(Arc::new(new_state));
+    *current = new_config;
+    response_with_content_type(
+        StatusCode::OK,
+        "application/json",
+        format!(r#"{{"status":"reloaded","routes":{routes},"plugins":{plugins}}}"#),
+    )
+}
+
+fn validate_reload_immutables(current: &AppConfig, next: &AppConfig) -> Result<(), String> {
+    if current.mode != next.mode {
+        return Err("server.mode cannot change during hot reload".to_owned());
+    }
+    if current.listen != next.listen {
+        return Err("server.listen cannot change during hot reload".to_owned());
+    }
+    if current.admin_listen != next.admin_listen {
+        return Err("server.admin_listen cannot change during hot reload".to_owned());
+    }
+    if current.server_tls != next.server_tls {
+        return Err("server.tls cannot change during hot reload".to_owned());
+    }
+    if current.admin.token_env != next.admin.token_env
+        || current.admin.allow_internal_network != next.admin.allow_internal_network
+    {
+        return Err("admin auth settings cannot change during hot reload".to_owned());
+    }
+    if current.upstream_tls != next.upstream_tls {
+        return Err("upstream_tls cannot change during hot reload".to_owned());
+    }
+    if current.storage != next.storage {
+        return Err("storage settings cannot change during hot reload".to_owned());
+    }
+    Ok(())
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 fn record_span_fields(

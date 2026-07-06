@@ -6,17 +6,22 @@ param(
 
 $ErrorActionPreference = "Stop"
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repo = Resolve-Path (Join-Path $scriptRoot "..\..\..")
+$scratch = Join-Path $repo "deployments\gcp\.scratch"
+New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 & "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Zone $Zone
 
 $ip = (gcloud compute instances describe $VmName --zone $Zone --format="value(networkInterfaces[0].accessConfigs[0].natIP)").Trim()
 if ([string]::IsNullOrWhiteSpace($ip)) {
     throw "no external IP found for $VmName"
 }
+$caPath = Join-Path $scratch "tracegate-ca.crt"
+gcloud compute scp "${VmName}:/opt/tracegate/tls/ca.crt" $caPath --zone $Zone
 
 function Invoke-Smoke($Path, $ExpectedStatus) {
-    $url = "http://${ip}:8080$Path"
+    $url = "https://${ip}:8080$Path"
     $tmp = New-TemporaryFile
-    $status = (curl.exe -sS -o $tmp -w "%{http_code}" $url).Trim()
+    $status = (curl.exe -sS --cacert $caPath -o $tmp -w "%{http_code}" $url).Trim()
     $body = Get-Content $tmp -Raw
     Remove-Item $tmp -Force
     Write-Host "$status $url"
@@ -27,9 +32,9 @@ function Invoke-Smoke($Path, $ExpectedStatus) {
 }
 
 function Invoke-KeyedSmoke($Path, $ExpectedStatus) {
-    $url = "http://${ip}:8080$Path"
+    $url = "https://${ip}:8080$Path"
     $tmp = New-TemporaryFile
-    $status = (curl.exe -sS -o $tmp -w "%{http_code}" -H "x-api-key: tracegate-demo-key" $url).Trim()
+    $status = (curl.exe -sS --cacert $caPath -o $tmp -w "%{http_code}" -H "x-api-key: tracegate-demo-key" $url).Trim()
     $body = Get-Content $tmp -Raw
     Remove-Item $tmp -Force
     Write-Host "$status $url"
@@ -40,9 +45,9 @@ function Invoke-KeyedSmoke($Path, $ExpectedStatus) {
 }
 
 function Invoke-PostSmoke($Path, $ExpectedStatus, $Body) {
-    $url = "http://${ip}:8080$Path"
+    $url = "https://${ip}:8080$Path"
     $tmp = New-TemporaryFile
-    $status = (curl.exe -sS -o $tmp -w "%{http_code}" -X POST -H "content-type: application/json" -H "authorization: Bearer should-not-be-stored" -H "x-api-key: tracegate-demo-key" --data $Body $url).Trim()
+    $status = (curl.exe -sS --cacert $caPath -o $tmp -w "%{http_code}" -X POST -H "content-type: application/json" -H "authorization: Bearer should-not-be-stored" -H "x-api-key: tracegate-demo-key" --data $Body $url).Trim()
     $body = Get-Content $tmp -Raw
     Remove-Item $tmp -Force
     Write-Host "$status POST $url"

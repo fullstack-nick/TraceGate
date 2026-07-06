@@ -2,7 +2,7 @@ param(
     [string] $ProjectId = "tracegate-r7m5o9ld",
     [string] $Zone = "us-central1-a",
     [string] $VmName = "tracegate-vm",
-    [string] $OutputName = "tracegate-capture-backup.db"
+    [string] $OutputName = "tracegate-capture-backup.sql"
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,13 +14,12 @@ New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 & "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Zone $Zone
 
 $remotePath = "/opt/tracegate/data/backups/$OutputName"
-$containerPath = "/var/lib/tracegate/backups/$OutputName"
 
 $remoteCommand = @"
 set -euxo pipefail
 sudo mkdir -p /opt/tracegate/data/backups
 sudo chown -R 10001:10001 /opt/tracegate/data
-docker exec tracegate tracegate storage backup --config /etc/tracegate/tracegate.toml --output $containerPath
+docker exec tracegate-postgres sh -c 'pg_dump -U "`$POSTGRES_USER" -d "`$POSTGRES_DB"' > $remotePath
 ls -lah $remotePath
 "@
 
