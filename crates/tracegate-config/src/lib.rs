@@ -2,7 +2,10 @@ use std::{collections::HashSet, fs, net::SocketAddr, path::Path, time::Duration}
 
 use serde::Deserialize;
 use thiserror::Error;
-use tracegate_core::{AppConfig, ObservabilityConfig, Route, Upstream};
+use tracegate_core::{
+    AppConfig, CaptureConfig, CapturePolicy, ObservabilityConfig, RedactionConfig, Route,
+    StorageConfig, Upstream,
+};
 use url::Url;
 
 #[derive(Debug, Error)]
@@ -27,6 +30,10 @@ pub enum ConfigError {
 pub struct RawConfig {
     pub server: ServerConfig,
     #[serde(default)]
+    pub storage: StorageRawConfig,
+    #[serde(default)]
+    pub redaction: RedactionRawConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
     pub observability: ObservabilityRawConfig,
@@ -44,6 +51,51 @@ pub struct ServerConfig {
 #[derive(Debug, Default, Deserialize)]
 pub struct LoggingConfig {
     pub json: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StorageRawConfig {
+    #[serde(default = "default_storage_driver")]
+    pub driver: String,
+    #[serde(default = "default_storage_url")]
+    pub url: String,
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
+    #[serde(default = "default_max_total_capture_bytes")]
+    pub max_total_capture_bytes: u64,
+    #[serde(default = "default_max_capture_bytes_per_request")]
+    pub max_capture_bytes_per_request: u64,
+}
+
+impl Default for StorageRawConfig {
+    fn default() -> Self {
+        let defaults = StorageConfig::default();
+        Self {
+            driver: defaults.driver,
+            url: defaults.url,
+            retention_days: defaults.retention_days,
+            max_total_capture_bytes: defaults.max_total_capture_bytes,
+            max_capture_bytes_per_request: defaults.max_capture_bytes_per_request,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RedactionRawConfig {
+    #[serde(default = "default_redaction_headers")]
+    pub headers: Vec<String>,
+    #[serde(default = "default_redaction_query_params")]
+    pub query_params: Vec<String>,
+}
+
+impl Default for RedactionRawConfig {
+    fn default() -> Self {
+        let defaults = RedactionConfig::default();
+        Self {
+            headers: defaults.headers,
+            query_params: defaults.query_params,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,6 +134,14 @@ pub struct RouteConfig {
     pub timeout_ms: u64,
     #[serde(default)]
     pub retries: u32,
+    #[serde(default = "default_capture_policy")]
+    pub capture_policy: String,
+    #[serde(default = "default_slow_threshold_ms")]
+    pub slow_threshold_ms: u64,
+    #[serde(default)]
+    pub capture_request_body: bool,
+    #[serde(default)]
+    pub capture_response_body_bytes: u64,
 }
 
 pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig, ConfigError> {
@@ -112,6 +172,8 @@ impl RawConfig {
             .parse()
             .map_err(|err| ConfigError::Invalid(format!("server.admin_listen: {err}")))?;
         let observability = validate_observability(self.logging, self.observability)?;
+        let storage = validate_storage(self.storage)?;
+        let redaction = validate_redaction(self.redaction)?;
 
         if self.routes.is_empty() {
             return Err(ConfigError::Invalid(
@@ -160,24 +222,175 @@ impl RawConfig {
                 .iter()
                 .map(|upstream| validate_upstream(&route.id, upstream))
                 .collect::<Result<Vec<_>, _>>()?;
+            let capture = validate_capture(&route, &storage)?;
 
-            routes.push(Route::new(
+            routes.push(Route::new_with_capture(
                 route.id,
                 route.hosts,
                 route.path_prefix,
                 upstreams,
                 Duration::from_millis(route.timeout_ms),
                 route.retries,
+                capture,
             ));
         }
 
         Ok(AppConfig {
             listen,
             admin_listen,
+            storage,
+            redaction,
             observability,
             routes,
         })
     }
+}
+
+fn validate_storage(raw: StorageRawConfig) -> Result<StorageConfig, ConfigError> {
+    let driver = raw.driver.trim().to_ascii_lowercase();
+    if driver != "sqlite" {
+        return Err(ConfigError::Invalid(format!(
+            "storage.driver must be `sqlite` in v0.3, got `{}`",
+            raw.driver
+        )));
+    }
+
+    let url = raw.url.trim().to_owned();
+    if url.is_empty() {
+        return Err(ConfigError::Invalid(
+            "storage.url cannot be empty".to_owned(),
+        ));
+    }
+
+    if !url.starts_with("sqlite:") {
+        return Err(ConfigError::Invalid(format!(
+            "storage.url `{url}` must use the sqlite scheme"
+        )));
+    }
+
+    if raw.retention_days == 0 || raw.retention_days > 365 {
+        return Err(ConfigError::Invalid(
+            "storage.retention_days must be between 1 and 365".to_owned(),
+        ));
+    }
+
+    if raw.max_total_capture_bytes == 0 {
+        return Err(ConfigError::Invalid(
+            "storage.max_total_capture_bytes must be greater than 0".to_owned(),
+        ));
+    }
+
+    if raw.max_capture_bytes_per_request == 0 {
+        return Err(ConfigError::Invalid(
+            "storage.max_capture_bytes_per_request must be greater than 0".to_owned(),
+        ));
+    }
+
+    if raw.max_capture_bytes_per_request > raw.max_total_capture_bytes {
+        return Err(ConfigError::Invalid(
+            "storage.max_capture_bytes_per_request cannot exceed storage.max_total_capture_bytes"
+                .to_owned(),
+        ));
+    }
+
+    Ok(StorageConfig {
+        driver,
+        url,
+        retention_days: raw.retention_days,
+        max_total_capture_bytes: raw.max_total_capture_bytes,
+        max_capture_bytes_per_request: raw.max_capture_bytes_per_request,
+    })
+}
+
+fn validate_redaction(raw: RedactionRawConfig) -> Result<RedactionConfig, ConfigError> {
+    let headers = normalize_redaction_list("redaction.headers", raw.headers)?;
+    let query_params = normalize_redaction_list("redaction.query_params", raw.query_params)?;
+
+    if headers.is_empty() {
+        return Err(ConfigError::Invalid(
+            "redaction.headers cannot be empty".to_owned(),
+        ));
+    }
+
+    if query_params.is_empty() {
+        return Err(ConfigError::Invalid(
+            "redaction.query_params cannot be empty".to_owned(),
+        ));
+    }
+
+    Ok(RedactionConfig {
+        headers,
+        query_params,
+    })
+}
+
+fn normalize_redaction_list(field: &str, values: Vec<String>) -> Result<Vec<String>, ConfigError> {
+    let mut normalized = Vec::with_capacity(values.len());
+    let mut seen = HashSet::new();
+
+    for value in values {
+        let value = value.trim().to_ascii_lowercase();
+        if value.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "{field} cannot contain empty values"
+            )));
+        }
+
+        if !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "{field} value `{value}` may only contain ASCII letters, digits, hyphen, underscore, or dot"
+            )));
+        }
+
+        if seen.insert(value.clone()) {
+            normalized.push(value);
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn validate_capture(
+    route: &RouteConfig,
+    storage: &StorageConfig,
+) -> Result<CaptureConfig, ConfigError> {
+    let policy = match route.capture_policy.trim().to_ascii_lowercase().as_str() {
+        "off" => CapturePolicy::Off,
+        "errors" => CapturePolicy::Errors,
+        "slow" => CapturePolicy::Slow,
+        "errors_and_slow" => CapturePolicy::ErrorsAndSlow,
+        "always" => CapturePolicy::Always,
+        value => {
+            return Err(ConfigError::Invalid(format!(
+                "route `{}` capture_policy `{value}` must be one of off, errors, slow, errors_and_slow, always",
+                route.id
+            )));
+        }
+    };
+
+    if route.slow_threshold_ms == 0 || route.slow_threshold_ms > 600_000 {
+        return Err(ConfigError::Invalid(format!(
+            "route `{}` slow_threshold_ms must be between 1 and 600000",
+            route.id
+        )));
+    }
+
+    if route.capture_response_body_bytes > storage.max_capture_bytes_per_request {
+        return Err(ConfigError::Invalid(format!(
+            "route `{}` capture_response_body_bytes cannot exceed storage.max_capture_bytes_per_request",
+            route.id
+        )));
+    }
+
+    Ok(CaptureConfig {
+        policy,
+        slow_threshold: Duration::from_millis(route.slow_threshold_ms),
+        capture_request_body: route.capture_request_body,
+        capture_response_body_bytes: route.capture_response_body_bytes,
+    })
 }
 
 fn validate_observability(
@@ -318,6 +531,34 @@ fn default_json_logging() -> bool {
     true
 }
 
+fn default_storage_driver() -> String {
+    StorageConfig::default().driver
+}
+
+fn default_storage_url() -> String {
+    StorageConfig::default().url
+}
+
+fn default_retention_days() -> u32 {
+    StorageConfig::default().retention_days
+}
+
+fn default_max_total_capture_bytes() -> u64 {
+    StorageConfig::default().max_total_capture_bytes
+}
+
+fn default_max_capture_bytes_per_request() -> u64 {
+    StorageConfig::default().max_capture_bytes_per_request
+}
+
+fn default_redaction_headers() -> Vec<String> {
+    RedactionConfig::default().headers
+}
+
+fn default_redaction_query_params() -> Vec<String> {
+    RedactionConfig::default().query_params
+}
+
 fn default_admin_listen() -> String {
     "127.0.0.1:9090".to_owned()
 }
@@ -338,6 +579,14 @@ fn default_timeout_ms() -> u64 {
     3000
 }
 
+fn default_capture_policy() -> String {
+    "off".to_owned()
+}
+
+fn default_slow_threshold_ms() -> u64 {
+    500
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +597,8 @@ mod tests {
                 listen: "127.0.0.1:8080".to_owned(),
                 admin_listen: None,
             },
+            storage: StorageRawConfig::default(),
+            redaction: RedactionRawConfig::default(),
             logging: LoggingConfig { json: Some(true) },
             observability: ObservabilityRawConfig::default(),
             routes: vec![RouteConfig {
@@ -357,6 +608,10 @@ mod tests {
                 upstreams: vec!["http://users-service:3000".to_owned()],
                 timeout_ms: 3000,
                 retries: 1,
+                capture_policy: "off".to_owned(),
+                slow_threshold_ms: 500,
+                capture_request_body: false,
+                capture_response_body_bytes: 0,
             }],
         }
     }
@@ -367,9 +622,14 @@ mod tests {
 
         assert_eq!(config.listen.to_string(), "127.0.0.1:8080");
         assert_eq!(config.admin_listen.to_string(), "127.0.0.1:9090");
+        assert_eq!(config.storage.driver, "sqlite");
+        assert_eq!(config.storage.retention_days, 7);
+        assert!(config.redaction.is_sensitive_header("Authorization"));
+        assert!(config.redaction.is_sensitive_query_param("ACCESS_TOKEN"));
         assert_eq!(config.observability.service_name, "tracegate");
         assert!(config.observability.prometheus_enabled);
         assert_eq!(config.routes.len(), 1);
+        assert_eq!(config.routes[0].capture.policy, CapturePolicy::Off);
     }
 
     #[test]
@@ -409,6 +669,55 @@ upstreams = ["http://users-service:3000"]
     }
 
     #[test]
+    fn parses_v3_capture_store_config() {
+        let raw = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[storage]
+driver = "sqlite"
+url = "sqlite://tracegate-test.db"
+retention_days = 3
+max_total_capture_bytes = 4096
+max_capture_bytes_per_request = 2048
+
+[redaction]
+headers = ["Authorization", "Cookie", "X-Api-Key"]
+query_params = ["token", "api_key"]
+
+[[routes]]
+id = "payments"
+hosts = ["*"]
+path_prefix = "/api/payments"
+upstreams = ["http://payments-service:4000"]
+capture_policy = "errors_and_slow"
+slow_threshold_ms = 250
+capture_request_body = true
+capture_response_body_bytes = 1024
+"#;
+
+        let config = toml::from_str::<RawConfig>(raw)
+            .unwrap()
+            .validate()
+            .unwrap();
+
+        assert_eq!(config.storage.url, "sqlite://tracegate-test.db");
+        assert_eq!(config.storage.retention_days, 3);
+        assert!(config.redaction.is_sensitive_header("authorization"));
+        assert!(config.redaction.is_sensitive_query_param("API_KEY"));
+        assert_eq!(
+            config.routes[0].capture.policy,
+            CapturePolicy::ErrorsAndSlow
+        );
+        assert_eq!(
+            config.routes[0].capture.slow_threshold,
+            Duration::from_millis(250)
+        );
+        assert!(config.routes[0].capture.capture_request_body);
+        assert_eq!(config.routes[0].capture.capture_response_body_bytes, 1024);
+    }
+
+    #[test]
     fn rejects_invalid_admin_listen() {
         let mut raw = valid_raw_config();
         raw.server.admin_listen = Some("not-an-address".to_owned());
@@ -445,10 +754,34 @@ upstreams = ["http://users-service:3000"]
             upstreams: vec!["http://other:3000".to_owned()],
             timeout_ms: 3000,
             retries: 0,
+            capture_policy: "off".to_owned(),
+            slow_threshold_ms: 500,
+            capture_request_body: false,
+            capture_response_body_bytes: 0,
         });
 
         let err = raw.validate().unwrap_err().to_string();
         assert!(err.contains("duplicate route id"));
+    }
+
+    #[test]
+    fn rejects_invalid_storage_caps() {
+        let mut raw = valid_raw_config();
+        raw.storage.max_total_capture_bytes = 1024;
+        raw.storage.max_capture_bytes_per_request = 2048;
+
+        let err = raw.validate().unwrap_err().to_string();
+        assert!(err.contains("max_capture_bytes_per_request"));
+    }
+
+    #[test]
+    fn rejects_route_capture_larger_than_storage_cap() {
+        let mut raw = valid_raw_config();
+        raw.storage.max_capture_bytes_per_request = 1024;
+        raw.routes[0].capture_response_body_bytes = 2048;
+
+        let err = raw.validate().unwrap_err().to_string();
+        assert!(err.contains("capture_response_body_bytes"));
     }
 
     #[test]

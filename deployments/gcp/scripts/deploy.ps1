@@ -2,7 +2,8 @@ param(
     [string] $ProjectId = "tracegate-r7m5o9ld",
     [string] $Zone = "us-central1-a",
     [string] $VmName = "tracegate-vm",
-    [string] $ImageTag = ""
+    [string] $ImageTag = "",
+    [switch] $AllowDirty
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,8 +14,18 @@ New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 
 & "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Zone $Zone
 
+$explicitImageTag = -not [string]::IsNullOrWhiteSpace($ImageTag)
+$dirtyStatus = (git -C $repo status --porcelain).Trim()
+if (-not [string]::IsNullOrWhiteSpace($dirtyStatus) -and -not $AllowDirty -and -not $explicitImageTag) {
+    throw "refusing to deploy a dirty worktree with an implicit Git SHA image tag. Commit changes first, pass -ImageTag explicitly, or pass -AllowDirty."
+}
+
 if ([string]::IsNullOrWhiteSpace($ImageTag)) {
     $ImageTag = (git -C $repo rev-parse --short=12 HEAD).Trim()
+}
+
+if (-not [string]::IsNullOrWhiteSpace($dirtyStatus)) {
+    Write-Warning "deploying with a dirty worktree because an explicit override was provided"
 }
 
 & "$scriptRoot\build-image.ps1" -ImageTag $ImageTag
@@ -25,7 +36,7 @@ $envPath = Join-Path $scratch "current.env"
 
 docker save "tracegate:$ImageTag" -o $tarPath
 
-gcloud compute ssh $VmName --zone $Zone --command "sudo mkdir -p /opt/tracegate && sudo chown `$USER:`$USER /opt/tracegate"
+gcloud compute ssh $VmName --zone $Zone --command "sudo mkdir -p /opt/tracegate/data/backups && sudo chown -R `$USER:`$USER /opt/tracegate && sudo chown -R 10001:10001 /opt/tracegate/data"
 gcloud compute scp $tarPath "${VmName}:/opt/tracegate/tracegate.tar" --zone $Zone
 gcloud compute scp "$repo\deployments\gcp\compose\docker-compose.yml" "${VmName}:/opt/tracegate/docker-compose.yml" --zone $Zone
 gcloud compute scp "$repo\deployments\gcp\compose\tracegate.toml" "${VmName}:/opt/tracegate/tracegate.toml" --zone $Zone
@@ -37,6 +48,8 @@ gcloud compute scp $envPath "${VmName}:/opt/tracegate/current.env.next" --zone $
 $remoteCommand = @'
 set -euxo pipefail
 cd /opt/tracegate
+sudo mkdir -p /opt/tracegate/data/backups
+sudo chown -R 10001:10001 /opt/tracegate/data
 if [ -f current.env ]; then cp current.env previous.env; fi
 mv current.env.next current.env
 docker load -i tracegate.tar

@@ -1,16 +1,20 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, path::Path, time::Duration};
 
 use axum::{
     Router,
-    body::Body,
+    body::{Body, Bytes as AxumBytes},
     extract::OriginalUri,
     http::{HeaderMap, Response, StatusCode},
     routing::any,
 };
 use tokio::{net::TcpListener, sync::oneshot};
-use tracegate_core::{AppConfig, ObservabilityConfig, Route, Upstream};
+use tracegate_core::{
+    AppConfig, CaptureConfig, CapturePolicy, ObservabilityConfig, RedactionConfig, Route,
+    StorageConfig, Upstream,
+};
 use tracegate_observability::{Telemetry, trace_id_hex_from_traceparent};
 use tracegate_proxy::{serve_listener, serve_listeners};
+use tracegate_storage::{ListFilters, Storage};
 
 async fn start_backend(
     status: StatusCode,
@@ -19,20 +23,22 @@ async fn start_backend(
 ) -> (SocketAddr, oneshot::Sender<()>) {
     let app = Router::new().route(
         "/{*path}",
-        any(move |OriginalUri(uri): OriginalUri| async move {
-            if let Some(delay) = delay {
-                tokio::time::sleep(delay).await;
-            }
+        any(
+            move |OriginalUri(uri): OriginalUri, _body: AxumBytes| async move {
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
 
-            Response::builder()
-                .status(status)
-                .header("content-type", "application/json")
-                .body(Body::from(format!(
-                    r#"{{"body":"{body}","path":"{}"}}"#,
-                    uri.path()
-                )))
-                .unwrap()
-        }),
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"body":"{body}","path":"{}"}}"#,
+                        uri.path()
+                    )))
+                    .unwrap()
+            },
+        ),
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -104,6 +110,29 @@ async fn start_proxy(route: Route) -> (SocketAddr, oneshot::Sender<()>) {
     (addr, shutdown_tx)
 }
 
+async fn start_proxy_with_storage(
+    route: Route,
+    storage: StorageConfig,
+) -> (SocketAddr, oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    let mut config = app_config(addr, "127.0.0.1:0".parse().unwrap(), vec![route]);
+    config.storage = storage;
+    let telemetry = Telemetry::new(&config.observability);
+
+    tokio::spawn(async move {
+        serve_listener(listener, config, telemetry, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    (addr, shutdown_tx)
+}
+
 async fn start_proxy_with_admin(route: Route) -> (SocketAddr, SocketAddr, oneshot::Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -142,6 +171,8 @@ fn app_config(listen: SocketAddr, admin_listen: SocketAddr, routes: Vec<Route>) 
     AppConfig {
         listen,
         admin_listen,
+        storage: storage_config(),
+        redaction: RedactionConfig::default(),
         observability: ObservabilityConfig {
             service_name: "tracegate-test".to_owned(),
             environment: "test".to_owned(),
@@ -153,6 +184,41 @@ fn app_config(listen: SocketAddr, admin_listen: SocketAddr, routes: Vec<Route>) 
     }
 }
 
+fn storage_config() -> StorageConfig {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tracegate.db");
+    std::mem::forget(dir);
+    StorageConfig {
+        url: sqlite_url(&path),
+        max_total_capture_bytes: 16 * 1024 * 1024,
+        max_capture_bytes_per_request: 1024 * 1024,
+        ..StorageConfig::default()
+    }
+}
+
+fn sqlite_url(path: &Path) -> String {
+    let path = path.display().to_string().replace('\\', "/");
+    if path.starts_with('/') {
+        format!("sqlite://{path}")
+    } else {
+        format!("sqlite:///{path}")
+    }
+}
+
+async fn wait_for_request(
+    storage: &Storage,
+    request_id: &str,
+) -> tracegate_storage::RequestDetails {
+    for _ in 0..40 {
+        if let Some(details) = storage.show_request(request_id).await.unwrap() {
+            return details;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!("request {request_id} was not persisted");
+}
+
 fn route_to(addr: SocketAddr, path_prefix: &str, timeout: Duration, retries: u32) -> Route {
     Route::new(
         "test",
@@ -161,6 +227,23 @@ fn route_to(addr: SocketAddr, path_prefix: &str, timeout: Duration, retries: u32
         vec![Upstream::parse(&format!("http://{addr}")).unwrap()],
         timeout,
         retries,
+    )
+}
+
+fn route_to_with_capture(
+    addr: SocketAddr,
+    path_prefix: &str,
+    timeout: Duration,
+    capture: CaptureConfig,
+) -> Route {
+    Route::new_with_capture(
+        "test",
+        vec!["*".to_owned()],
+        path_prefix,
+        vec![Upstream::parse(&format!("http://{addr}")).unwrap()],
+        timeout,
+        0,
+        capture,
     )
 }
 
@@ -299,6 +382,96 @@ async fn preserves_backend_500_response() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let _ = proxy_shutdown.send(());
+    let _ = backend_shutdown.send(());
+}
+
+#[tokio::test]
+async fn captures_failed_request_with_redaction_and_truncation() {
+    let (backend_addr, backend_shutdown) =
+        start_backend(StatusCode::INTERNAL_SERVER_ERROR, "payments", None).await;
+    let storage = StorageConfig {
+        max_total_capture_bytes: 4096,
+        max_capture_bytes_per_request: 32,
+        ..storage_config()
+    };
+    let storage_for_query = storage.clone();
+    let (proxy_addr, proxy_shutdown) = start_proxy_with_storage(
+        route_to_with_capture(
+            backend_addr,
+            "/api/payments",
+            Duration::from_secs(1),
+            CaptureConfig {
+                policy: CapturePolicy::ErrorsAndSlow,
+                slow_threshold: Duration::from_millis(250),
+                capture_request_body: true,
+                capture_response_body_bytes: 16,
+            },
+        ),
+        storage,
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{proxy_addr}/api/payments/fail?token=secret&visible=yes"
+        ))
+        .header("authorization", "Bearer secret")
+        .header("content-type", "application/json")
+        .body(r#"{"card":"4242424242424242","note":"this body is intentionally long"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let _ = response.text().await.unwrap();
+
+    let storage = Storage::connect(&storage_for_query).await.unwrap();
+    storage.migrate().await.unwrap();
+    let details = wait_for_request(&storage, &request_id).await;
+
+    assert_eq!(
+        details.request.redacted_query.as_deref(),
+        Some("visible=yes")
+    );
+    assert!(details.request.query_hash.is_some());
+    assert!(details.request.is_error);
+    assert!(
+        !details
+            .request_headers
+            .iter()
+            .any(|h| h.name == "authorization")
+    );
+    assert!(
+        details
+            .request_headers
+            .iter()
+            .any(|h| h.name == "content-type" && h.value.starts_with("application/json"))
+    );
+
+    let capture = details.capture.unwrap();
+    assert_eq!(capture.request_body.as_ref().unwrap().len(), 32);
+    assert!(capture.request_body_truncated);
+    assert!(capture.response_body_truncated);
+    assert!(capture.request_body_sha256.is_some());
+
+    let rows = storage
+        .list_requests(ListFilters {
+            failed: true,
+            limit: 10,
+            ..ListFilters::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
 
     let _ = proxy_shutdown.send(());
     let _ = backend_shutdown.send(());

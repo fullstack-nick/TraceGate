@@ -2,6 +2,7 @@ use std::{net::SocketAddr, str::FromStr};
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{OriginalUri, State},
     http::StatusCode,
     routing::any,
@@ -35,6 +36,9 @@ struct DemoResponse {
     service: &'static str,
     path: String,
     ok: bool,
+    body_len: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<String>,
 }
 
 #[tokio::main]
@@ -65,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
 async fn handler(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    body: Bytes,
 ) -> (StatusCode, Json<DemoResponse>) {
     match state.service {
         ServiceKind::Users => (
@@ -73,6 +78,31 @@ async fn handler(
                 service: "users",
                 path: uri.path().to_owned(),
                 ok: true,
+                body_len: body.len(),
+                payload: None,
+            }),
+        ),
+        ServiceKind::Payments if uri.path() == "/api/payments/slow" => {
+            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+            (
+                StatusCode::OK,
+                Json(DemoResponse {
+                    service: "payments",
+                    path: uri.path().to_owned(),
+                    ok: true,
+                    body_len: body.len(),
+                    payload: None,
+                }),
+            )
+        }
+        ServiceKind::Payments if uri.path() == "/api/payments/large-fail" => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(DemoResponse {
+                service: "payments",
+                path: uri.path().to_owned(),
+                ok: false,
+                body_len: body.len(),
+                payload: Some("x".repeat(8192)),
             }),
         ),
         ServiceKind::Payments if uri.path() == "/api/payments/fail" => (
@@ -81,6 +111,8 @@ async fn handler(
                 service: "payments",
                 path: uri.path().to_owned(),
                 ok: false,
+                body_len: body.len(),
+                payload: None,
             }),
         ),
         ServiceKind::Payments => (
@@ -89,6 +121,8 @@ async fn handler(
                 service: "payments",
                 path: uri.path().to_owned(),
                 ok: true,
+                body_len: body.len(),
+                payload: None,
             }),
         ),
     }

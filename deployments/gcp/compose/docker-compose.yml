@@ -8,6 +8,7 @@ services:
       - "8080:8080"
     volumes:
       - /opt/tracegate/tracegate.toml:/etc/tracegate/tracegate.toml:ro
+      - /opt/tracegate/data:/var/lib/tracegate
     depends_on:
       - otel-collector
       - users-service

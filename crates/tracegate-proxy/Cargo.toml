@@ -9,17 +9,22 @@ repository.workspace = true
 [dependencies]
 bytes.workspace = true
 http.workspace = true
+http-body.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+pin-project-lite.workspace = true
 serde.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracegate-core = { path = "../tracegate-core" }
 tracegate-observability = { path = "../tracegate-observability" }
+tracegate-storage = { path = "../tracegate-storage" }
 tracing.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true

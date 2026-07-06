@@ -46,6 +46,9 @@ struct TelemetryInner {
     requests: Family<RequestLabels, Counter>,
     request_duration: Family<RequestLabels, Histogram, HistogramConstructor>,
     upstream_errors: Family<UpstreamErrorLabels, Counter>,
+    captures: Counter,
+    capture_dropped: Counter,
+    retention_runs: Counter,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
@@ -113,6 +116,9 @@ impl Telemetry {
                 },
             );
         let upstream_errors = Family::<UpstreamErrorLabels, Counter>::default();
+        let captures = Counter::default();
+        let capture_dropped = Counter::default();
+        let retention_runs = Counter::default();
         let mut registry = Registry::default();
 
         registry.register(
@@ -130,6 +136,21 @@ impl Telemetry {
             "TraceGate upstream error responses and transport failures.",
             upstream_errors.clone(),
         );
+        registry.register(
+            "tracegate_captures",
+            "Request and response captures persisted by TraceGate.",
+            captures.clone(),
+        );
+        registry.register(
+            "tracegate_capture_dropped",
+            "Capture or request-storage writes dropped without breaking proxy traffic.",
+            capture_dropped.clone(),
+        );
+        registry.register(
+            "tracegate_storage_retention_runs",
+            "Capture-store retention runs completed by TraceGate.",
+            retention_runs.clone(),
+        );
 
         Self {
             inner: Arc::new(TelemetryInner {
@@ -138,6 +159,9 @@ impl Telemetry {
                 requests,
                 request_duration,
                 upstream_errors,
+                captures,
+                capture_dropped,
+                retention_runs,
             }),
         }
     }
@@ -169,6 +193,18 @@ impl Telemetry {
                 })
                 .inc();
         }
+    }
+
+    pub fn record_capture(&self) {
+        self.inner.captures.inc();
+    }
+
+    pub fn record_capture_dropped(&self) {
+        self.inner.capture_dropped.inc();
+    }
+
+    pub fn record_retention_run(&self) {
+        self.inner.retention_runs.inc();
     }
 
     pub fn render_prometheus(&self) -> Result<String, std::fmt::Error> {
@@ -360,6 +396,20 @@ mod tests {
         assert!(metrics.contains("route_id=\"payments\""));
         assert!(metrics.contains("tracegate_request_duration_seconds"));
         assert!(metrics.contains("tracegate_upstream_errors_total"));
+    }
+
+    #[test]
+    fn metrics_record_capture_and_retention_counts() {
+        let telemetry = Telemetry::new(&config(true));
+
+        telemetry.record_capture();
+        telemetry.record_capture_dropped();
+        telemetry.record_retention_run();
+
+        let metrics = telemetry.render_prometheus().unwrap();
+        assert!(metrics.contains("tracegate_captures_total"));
+        assert!(metrics.contains("tracegate_capture_dropped_total"));
+        assert!(metrics.contains("tracegate_storage_retention_runs_total"));
     }
 
     #[test]

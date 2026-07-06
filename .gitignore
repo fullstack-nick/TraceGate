@@ -18,3 +18,4 @@ target/
 # Local deployment/proof scratch files.
 proof/tmp/
 deployments/gcp/.scratch/
+data/

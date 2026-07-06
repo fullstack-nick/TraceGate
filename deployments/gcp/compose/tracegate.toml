@@ -5,9 +5,20 @@ admin_listen = "0.0.0.0:9090"
 [logging]
 json = true
 
+[storage]
+driver = "sqlite"
+url = "sqlite:///var/lib/tracegate/tracegate.db"
+retention_days = 7
+max_total_capture_bytes = 1073741824
+max_capture_bytes_per_request = 1048576
+
+[redaction]
+headers = ["authorization", "cookie", "set-cookie", "x-api-key"]
+query_params = ["token", "access_token", "api_key"]
+
 [observability]
 service_name = "tracegate"
-environment = "gcp-v0.2"
+environment = "gcp-v0.3"
 otlp_endpoint = "http://otel-collector:4317"
 prometheus_enabled = true
 json_logs = true
@@ -19,6 +30,7 @@ path_prefix = "/api/users"
 upstreams = ["http://users-service:3000"]
 timeout_ms = 3000
 retries = 1
+capture_policy = "off"
 
 [[routes]]
 id = "payments"
@@ -27,3 +39,7 @@ path_prefix = "/api/payments"
 upstreams = ["http://payments-service:4000"]
 timeout_ms = 3000
 retries = 0
+capture_policy = "errors_and_slow"
+slow_threshold_ms = 500
+capture_request_body = true
+capture_response_body_bytes = 4096

@@ -9,7 +9,9 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+serde_json.workspace = true
 tracegate-config = { path = "../tracegate-config" }
 tracegate-observability = { path = "../tracegate-observability" }
 tracegate-proxy = { path = "../tracegate-proxy" }
+tracegate-storage = { path = "../tracegate-storage" }
 tokio.workspace = true

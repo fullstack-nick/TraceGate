@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    fmt,
     net::SocketAddr,
     sync::{
         Arc,
@@ -30,6 +31,8 @@ pub enum CoreError {
 pub struct AppConfig {
     pub listen: SocketAddr,
     pub admin_listen: SocketAddr,
+    pub storage: StorageConfig,
+    pub redaction: RedactionConfig,
     pub observability: ObservabilityConfig,
     pub routes: Vec<Route>,
 }
@@ -43,6 +46,121 @@ pub struct ObservabilityConfig {
     pub json_logs: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageConfig {
+    pub driver: String,
+    pub url: String,
+    pub retention_days: u32,
+    pub max_total_capture_bytes: u64,
+    pub max_capture_bytes_per_request: u64,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            driver: "sqlite".to_owned(),
+            url: "sqlite://tracegate.db".to_owned(),
+            retention_days: 7,
+            max_total_capture_bytes: 1_073_741_824,
+            max_capture_bytes_per_request: 1_048_576,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RedactionConfig {
+    pub headers: Vec<String>,
+    pub query_params: Vec<String>,
+}
+
+impl Default for RedactionConfig {
+    fn default() -> Self {
+        Self {
+            headers: vec![
+                "authorization".to_owned(),
+                "cookie".to_owned(),
+                "set-cookie".to_owned(),
+                "x-api-key".to_owned(),
+            ],
+            query_params: vec![
+                "token".to_owned(),
+                "access_token".to_owned(),
+                "api_key".to_owned(),
+            ],
+        }
+    }
+}
+
+impl RedactionConfig {
+    pub fn is_sensitive_header(&self, name: &str) -> bool {
+        self.headers
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(name))
+    }
+
+    pub fn is_sensitive_query_param(&self, name: &str) -> bool {
+        self.query_params
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(name))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapturePolicy {
+    Off,
+    Errors,
+    Slow,
+    ErrorsAndSlow,
+    Always,
+}
+
+impl CapturePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Errors => "errors",
+            Self::Slow => "slow",
+            Self::ErrorsAndSlow => "errors_and_slow",
+            Self::Always => "always",
+        }
+    }
+
+    pub fn should_capture(self, is_error: bool, is_slow: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Errors => is_error,
+            Self::Slow => is_slow,
+            Self::ErrorsAndSlow => is_error || is_slow,
+            Self::Always => true,
+        }
+    }
+}
+
+impl fmt::Display for CapturePolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CaptureConfig {
+    pub policy: CapturePolicy,
+    pub slow_threshold: Duration,
+    pub capture_request_body: bool,
+    pub capture_response_body_bytes: u64,
+}
+
+impl Default for CaptureConfig {
+    fn default() -> Self {
+        Self {
+            policy: CapturePolicy::Off,
+            slow_threshold: Duration::from_millis(500),
+            capture_request_body: false,
+            capture_response_body_bytes: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Route {
     pub id: String,
@@ -51,6 +169,7 @@ pub struct Route {
     pub upstreams: Vec<Upstream>,
     pub timeout: Duration,
     pub retries: u32,
+    pub capture: CaptureConfig,
     next_upstream: Arc<AtomicUsize>,
 }
 
@@ -63,6 +182,26 @@ impl Route {
         timeout: Duration,
         retries: u32,
     ) -> Self {
+        Self::new_with_capture(
+            id,
+            hosts,
+            path_prefix,
+            upstreams,
+            timeout,
+            retries,
+            CaptureConfig::default(),
+        )
+    }
+
+    pub fn new_with_capture(
+        id: impl Into<String>,
+        hosts: Vec<String>,
+        path_prefix: impl Into<String>,
+        upstreams: Vec<Upstream>,
+        timeout: Duration,
+        retries: u32,
+        capture: CaptureConfig,
+    ) -> Self {
         Self {
             id: id.into(),
             hosts,
@@ -70,6 +209,7 @@ impl Route {
             upstreams,
             timeout,
             retries,
+            capture,
             next_upstream: Arc::new(AtomicUsize::new(0)),
         }
     }

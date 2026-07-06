@@ -2,7 +2,7 @@
 
 TraceGate is a Rust observability API gateway that routes HTTP traffic and is being built toward failure capture, replay, and sandboxed request-policy plugins.
 
-v0.2 provides the gateway foundation plus observability:
+v0.3 provides the gateway foundation, observability, and a SQLite capture store:
 
 - host and path-prefix routing
 - Hyper-based reverse proxying
@@ -11,6 +11,10 @@ v0.2 provides the gateway foundation plus observability:
 - W3C `traceparent` propagation
 - OpenTelemetry OTLP trace export
 - Prometheus metrics on the admin listener
+- SQLite request metadata and bounded capture storage
+- redacted header/query storage for captured requests
+- `tracegate requests list` and `tracegate requests show`
+- `tracegate storage migrate`, `prune`, and `backup`
 - `/health/live` and `/health/ready`
 - per-route timeouts and retry configuration
 - local Docker Compose demo with users and payments backends, OpenTelemetry Collector, Jaeger, and Prometheus
@@ -22,9 +26,13 @@ v0.2 provides the gateway foundation plus observability:
 docker compose up --build
 curl.exe -i http://localhost:8080/api/users/123
 curl.exe -i http://localhost:8080/api/payments/fail
+curl.exe -i "http://localhost:8080/api/payments/slow?token=secret&visible=yes"
+curl.exe -i -X POST -H "content-type: application/json" -H "authorization: Bearer secret" --data "{\"card\":\"4242\",\"note\":\"capture proof\"}" "http://localhost:8080/api/payments/large-fail?api_key=secret&visible=yes"
 curl.exe -s http://localhost:9090/health/live
 curl.exe -s http://localhost:9090/metrics
 docker logs tracegate-tracegate-1 --tail 50
+docker compose exec tracegate tracegate requests list --config /etc/tracegate/tracegate.toml --failed
+docker compose exec tracegate tracegate requests list --config /etc/tracegate/tracegate.toml --slow
 ```
 
 Expected behavior:
@@ -34,6 +42,9 @@ Expected behavior:
 - TraceGate logs one JSON completion event per request with `request_id`, `route_id`, `upstream`, `status`, and `latency_ms`.
 - TraceGate injects or propagates `traceparent` to upstream requests.
 - Prometheus exposes `tracegate_requests_total`, `tracegate_request_duration_seconds`, and `tracegate_upstream_errors_total`.
+- Prometheus exposes `tracegate_captures_total`, `tracegate_capture_dropped_total`, and `tracegate_storage_retention_runs_total`.
+- Failed and slow payment requests are persisted in `/var/lib/tracegate/tracegate.db`.
+- Stored query strings omit configured sensitive params such as `token`, `access_token`, and `api_key`; stored headers omit configured sensitive headers such as `authorization`, `cookie`, `set-cookie`, and `x-api-key`.
 - Jaeger is available locally at `http://localhost:16686`; Prometheus is available locally at `http://localhost:9091`.
 
 ## Local Checks
@@ -61,6 +72,8 @@ deployments/gcp/scripts/bootstrap-project.ps1 -BillingAccount <billing-account-i
 deployments/gcp/scripts/terraform-apply.ps1
 deployments/gcp/scripts/deploy.ps1
 deployments/gcp/scripts/smoke.ps1
+deployments/gcp/scripts/inspect-captures.ps1
+deployments/gcp/scripts/backup-storage.ps1
 deployments/gcp/scripts/inspect-observability.ps1
 deployments/gcp/scripts/logs.ps1
 ```
