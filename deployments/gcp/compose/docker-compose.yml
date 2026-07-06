@@ -1,0 +1,29 @@
+services:
+  tracegate:
+    image: ${TRACEGATE_IMAGE}
+    container_name: tracegate
+    command: ["tracegate", "serve", "--config", "/etc/tracegate/tracegate.toml"]
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - /opt/tracegate/tracegate.toml:/etc/tracegate/tracegate.toml:ro
+    depends_on:
+      - users-service
+      - payments-service
+
+  users-service:
+    image: ${TRACEGATE_IMAGE}
+    container_name: tracegate-users-service
+    command: ["tracegate-demo-backend", "--service", "users", "--listen", "0.0.0.0:3000"]
+    restart: unless-stopped
+    expose:
+      - "3000"
+
+  payments-service:
+    image: ${TRACEGATE_IMAGE}
+    container_name: tracegate-payments-service
+    command: ["tracegate-demo-backend", "--service", "payments", "--listen", "0.0.0.0:4000"]
+    restart: unless-stopped
+    expose:
+      - "4000"

@@ -1,0 +1,10 @@
+target
+.git
+.terraform
+**/terraform.tfstate
+**/terraform.tfstate.*
+**/*.tfplan
+deployments/gcp/.scratch
+proof/tmp
+*.tar
+*.tar.gz

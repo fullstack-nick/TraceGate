@@ -1,0 +1,27 @@
+services:
+  tracegate:
+    build:
+      context: .
+      args:
+        TRACEGATE_GIT_SHA: ${TRACEGATE_GIT_SHA:-local}
+    image: tracegate:${TRACEGATE_IMAGE_TAG:-local}
+    command: ["tracegate", "serve", "--config", "/etc/tracegate/tracegate.toml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./examples/tracegate.toml:/etc/tracegate/tracegate.toml:ro
+    depends_on:
+      - users-service
+      - payments-service
+
+  users-service:
+    image: tracegate:${TRACEGATE_IMAGE_TAG:-local}
+    command: ["tracegate-demo-backend", "--service", "users", "--listen", "0.0.0.0:3000"]
+    expose:
+      - "3000"
+
+  payments-service:
+    image: tracegate:${TRACEGATE_IMAGE_TAG:-local}
+    command: ["tracegate-demo-backend", "--service", "payments", "--listen", "0.0.0.0:4000"]
+    expose:
+      - "4000"

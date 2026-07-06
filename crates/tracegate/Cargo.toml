@@ -1,0 +1,15 @@
+[package]
+name = "tracegate"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tracegate-config = { path = "../tracegate-config" }
+tracegate-proxy = { path = "../tracegate-proxy" }
+tokio.workspace = true
+tracing-subscriber.workspace = true
