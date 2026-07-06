@@ -132,8 +132,9 @@ EOF
     -out /opt/tracegate/tls/upstreams.crt \
     -extfile /opt/tracegate/tls/upstreams.cnf \
     -extensions ext
-  chmod 600 /opt/tracegate/tls/*.key
 fi
+sudo chown -R 10001:10001 /opt/tracegate/tls
+find /opt/tracegate/tls -type f -name '*.key' -exec chmod 640 {} \;
 sudo chown -R 10001:10001 /opt/tracegate/postgres
 if [ -f current.env ]; then cp current.env previous.env; fi
 mv current.env.next current.env
