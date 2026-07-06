@@ -15,7 +15,7 @@ New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 & "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Zone $Zone
 
 $explicitImageTag = -not [string]::IsNullOrWhiteSpace($ImageTag)
-$dirtyStatus = (git -C $repo status --porcelain).Trim()
+$dirtyStatus = (@(git -C $repo status --porcelain) -join "`n").Trim()
 if (-not [string]::IsNullOrWhiteSpace($dirtyStatus) -and -not $AllowDirty -and -not $explicitImageTag) {
     throw "refusing to deploy a dirty worktree with an implicit Git SHA image tag. Commit changes first, pass -ImageTag explicitly, or pass -AllowDirty."
 }
