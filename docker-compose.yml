@@ -16,6 +16,7 @@ services:
       - otel-collector
       - users-service
       - payments-service
+      - replay-target
 
   users-service:
     image: tracegate:${TRACEGATE_IMAGE_TAG:-local}
@@ -28,6 +29,12 @@ services:
     command: ["tracegate-demo-backend", "--service", "payments", "--listen", "0.0.0.0:4000"]
     expose:
       - "4000"
+
+  replay-target:
+    image: tracegate:${TRACEGATE_IMAGE_TAG:-local}
+    command: ["tracegate-demo-backend", "--service", "replay", "--listen", "0.0.0.0:4000"]
+    ports:
+      - "4000:4000"
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.155.0

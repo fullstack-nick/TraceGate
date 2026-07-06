@@ -2513,6 +2513,7 @@ dependencies = [
  "tracegate-config",
  "tracegate-observability",
  "tracegate-proxy",
+ "tracegate-replay",
  "tracegate-storage",
 ]
 
@@ -2590,6 +2591,23 @@ dependencies = [
  "tracegate-observability",
  "tracegate-storage",
  "tracing",
+]
+
+[[package]]
+name = "tracegate-replay"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "http",
+ "reqwest 0.12.28",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracegate-core",
+ "tracegate-storage",
+ "url",
+ "uuid",
 ]
 
 [[package]]

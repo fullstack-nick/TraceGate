@@ -13,6 +13,7 @@ services:
       - otel-collector
       - users-service
       - payments-service
+      - replay-target
 
   users-service:
     image: ${TRACEGATE_IMAGE}
@@ -26,6 +27,14 @@ services:
     image: ${TRACEGATE_IMAGE}
     container_name: tracegate-payments-service
     command: ["tracegate-demo-backend", "--service", "payments", "--listen", "0.0.0.0:4000"]
+    restart: unless-stopped
+    expose:
+      - "4000"
+
+  replay-target:
+    image: ${TRACEGATE_IMAGE}
+    container_name: tracegate-replay-target
+    command: ["tracegate-demo-backend", "--service", "replay", "--listen", "0.0.0.0:4000"]
     restart: unless-stopped
     expose:
       - "4000"

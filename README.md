@@ -2,7 +2,7 @@
 
 TraceGate is a Rust observability API gateway that routes HTTP traffic and is being built toward failure capture, replay, and sandboxed request-policy plugins.
 
-v0.3 provides the gateway foundation, observability, and a SQLite capture store:
+v0.4 provides the gateway foundation, observability, a SQLite capture store, and safe replay:
 
 - host and path-prefix routing
 - Hyper-based reverse proxying
@@ -14,10 +14,12 @@ v0.3 provides the gateway foundation, observability, and a SQLite capture store:
 - SQLite request metadata and bounded capture storage
 - redacted header/query storage for captured requests
 - `tracegate requests list` and `tracegate requests show`
+- `tracegate replay --id` and `tracegate replay --last-failed`
+- replay audit records with status, latency, target, and replay metadata
 - `tracegate storage migrate`, `prune`, and `backup`
 - `/health/live` and `/health/ready`
 - per-route timeouts and retry configuration
-- local Docker Compose demo with users and payments backends, OpenTelemetry Collector, Jaeger, and Prometheus
+- local Docker Compose demo with users, payments, a safe replay target, OpenTelemetry Collector, Jaeger, and Prometheus
 - Terraform and SSH-based GCP Compute Engine deployment assets
 
 ## Local Demo
@@ -33,6 +35,9 @@ curl.exe -s http://localhost:9090/metrics
 docker logs tracegate-tracegate-1 --tail 50
 docker compose exec tracegate tracegate requests list --config /etc/tracegate/tracegate.toml --failed
 docker compose exec tracegate tracegate requests list --config /etc/tracegate/tracegate.toml --slow
+docker compose exec tracegate tracegate replay --config /etc/tracegate/tracegate.toml --last-failed --target http://replay-target:4000 --confirm-side-effects
+docker compose exec tracegate tracegate requests show --config /etc/tracegate/tracegate.toml --id <request-id>
+docker compose logs replay-target --tail 50
 ```
 
 Expected behavior:
@@ -45,6 +50,8 @@ Expected behavior:
 - Prometheus exposes `tracegate_captures_total`, `tracegate_capture_dropped_total`, and `tracegate_storage_retention_runs_total`.
 - Failed and slow payment requests are persisted in `/var/lib/tracegate/tracegate.db`.
 - Stored query strings omit configured sensitive params such as `token`, `access_token`, and `api_key`; stored headers omit configured sensitive headers such as `authorization`, `cookie`, `set-cookie`, and `x-api-key`.
+- Replaying a captured failed payment request sends it to the safe replay target, adds replay metadata headers, and persists a replay audit record.
+- Mutating replay methods require `--confirm-side-effects`.
 - Jaeger is available locally at `http://localhost:16686`; Prometheus is available locally at `http://localhost:9091`.
 
 ## Local Checks
@@ -55,13 +62,13 @@ scripts/cargo.ps1 clippy --workspace --all-targets -- -D warnings
 scripts/cargo.ps1 test --workspace
 ```
 
-## GCP v0.2 Deployment
+## GCP Deployment
 
 The live deployment path is intentionally direct-control:
 
 - dedicated TraceGate GCP project
 - Terraform-managed `e2-micro` Compute Engine VM in `us-central1-a`
-- Docker Compose under systemd with TraceGate, demo backends, OpenTelemetry Collector, Jaeger, and Prometheus
+- Docker Compose under systemd with TraceGate, demo backends, a safe internal replay target, OpenTelemetry Collector, Jaeger, and Prometheus
 - local image build, `docker save`, `gcloud compute scp`, VM-side `docker load`
 - live `curl` smoke plus SSH telemetry/log inspection
 
@@ -73,9 +80,10 @@ deployments/gcp/scripts/terraform-apply.ps1
 deployments/gcp/scripts/deploy.ps1
 deployments/gcp/scripts/smoke.ps1
 deployments/gcp/scripts/inspect-captures.ps1
+deployments/gcp/scripts/inspect-replay.ps1
 deployments/gcp/scripts/backup-storage.ps1
 deployments/gcp/scripts/inspect-observability.ps1
 deployments/gcp/scripts/logs.ps1
 ```
 
-The guard script refuses to deploy unless the active account is `nickaccturk@gmail.com` and the active project is a dedicated `tracegate-*` project. Only TraceGate's public HTTP port `8080` is exposed by Terraform; telemetry services are inspected over SSH inside the VM.
+The guard script refuses to deploy unless the active account is `nickaccturk@gmail.com` and the active project is a dedicated `tracegate-*` project. Only TraceGate's public HTTP port `8080` is exposed by Terraform; telemetry services and the replay target are inspected over SSH inside the VM.

@@ -18,7 +18,7 @@ query_params = ["token", "access_token", "api_key"]
 
 [observability]
 service_name = "tracegate"
-environment = "gcp-v0.3"
+environment = "gcp-v0.4"
 otlp_endpoint = "http://otel-collector:4317"
 prometheus_enabled = true
 json_logs = true

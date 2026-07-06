@@ -13,5 +13,6 @@ serde_json.workspace = true
 tracegate-config = { path = "../tracegate-config" }
 tracegate-observability = { path = "../tracegate-observability" }
 tracegate-proxy = { path = "../tracegate-proxy" }
+tracegate-replay = { path = "../tracegate-replay" }
 tracegate-storage = { path = "../tracegate-storage" }
 tokio.workspace = true

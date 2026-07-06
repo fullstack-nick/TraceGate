@@ -44,6 +44,17 @@ Invoke-Smoke "/api/payments/fail" 500
 Invoke-Smoke "/api/payments/slow?token=should-not-be-stored&visible=yes" 200
 Invoke-PostSmoke "/api/payments/large-fail?api_key=should-not-be-stored&visible=yes" 500 '{"card":"4242424242424242","note":"large request body for capture truncation proof"}'
 
+$replayCommand = @'
+set -euxo pipefail
+docker exec tracegate tracegate replay --config /etc/tracegate/tracegate.toml --last-failed --target http://replay-target:4000 --confirm-side-effects
+latest_failed="$(docker exec tracegate tracegate requests list --config /etc/tracegate/tracegate.toml --failed --limit 1 | awk 'NR==2 {print $6}')"
+if [ -n "$latest_failed" ]; then
+  docker exec tracegate tracegate requests show --config /etc/tracegate/tracegate.toml --id "$latest_failed"
+fi
+docker logs tracegate-replay-target --tail 100
+'@
+
+gcloud compute ssh $VmName --zone $Zone --command $replayCommand
 gcloud compute ssh $VmName --zone $Zone --command "docker logs tracegate --tail 100"
 & "$scriptRoot\inspect-observability.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName
 & "$scriptRoot\inspect-captures.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName

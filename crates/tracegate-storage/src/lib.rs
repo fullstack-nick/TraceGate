@@ -101,6 +101,7 @@ pub struct RequestDetails {
     pub request_headers: Vec<StoredHeader>,
     pub response_headers: Vec<StoredHeader>,
     pub capture: Option<CaptureDetails>,
+    pub replay_runs: Vec<ReplayRun>,
 }
 
 #[derive(Clone, Debug, Serialize, sqlx::FromRow)]
@@ -114,6 +115,36 @@ pub struct CaptureDetails {
     pub request_body_sha256: Option<String>,
     pub response_body_sha256: Option<String>,
     pub body_evicted: bool,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReplayRunInsert {
+    pub replay_id: String,
+    pub original_request_id: String,
+    pub replay_request_id: String,
+    pub target: String,
+    pub method: String,
+    pub path: String,
+    pub status: Option<u16>,
+    pub latency_ms: u128,
+    pub error: Option<String>,
+    pub diff_summary: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
+pub struct ReplayRun {
+    pub replay_id: String,
+    pub original_request_id: String,
+    pub replay_request_id: String,
+    pub target: String,
+    pub method: String,
+    pub path: String,
+    pub status: Option<i64>,
+    pub latency_ms: i64,
+    pub error: Option<String>,
+    pub diff_summary: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -354,13 +385,62 @@ impl Storage {
         .bind(request_id)
         .fetch_optional(&self.pool)
         .await?;
+        let replay_runs = self.list_replay_runs(request_id).await?;
 
         Ok(Some(RequestDetails {
             request,
             request_headers,
             response_headers,
             capture,
+            replay_runs,
         }))
+    }
+
+    pub async fn insert_replay_run(&self, run: ReplayRunInsert) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO replay_runs (
+                replay_id, original_request_id, replay_request_id, target, method, path,
+                status, latency_ms, error, diff_summary, created_at_ms
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(run.replay_id)
+        .bind(run.original_request_id)
+        .bind(run.replay_request_id)
+        .bind(run.target)
+        .bind(run.method)
+        .bind(run.path)
+        .bind(run.status.map(i64::from))
+        .bind(run.latency_ms.min(i64::MAX as u128) as i64)
+        .bind(run.error)
+        .bind(run.diff_summary)
+        .bind(run.created_at_ms)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn list_replay_runs(
+        &self,
+        original_request_id: &str,
+    ) -> Result<Vec<ReplayRun>, StorageError> {
+        let runs = sqlx::query_as::<_, ReplayRun>(
+            r#"
+            SELECT replay_id, original_request_id, replay_request_id, target, method, path,
+                   status, latency_ms, error, diff_summary, created_at_ms
+            FROM replay_runs
+            WHERE original_request_id = ?
+            ORDER BY created_at_ms DESC
+            "#,
+        )
+        .bind(original_request_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(runs)
     }
 
     pub async fn run_retention(&self) -> Result<RetentionOutcome, StorageError> {
@@ -637,5 +717,39 @@ mod tests {
 
         assert!(backup.exists());
         assert!(backup.metadata().unwrap().len() > 0);
+    }
+
+    #[tokio::test]
+    async fn persists_replay_runs_with_request_details() {
+        let (storage, _dir) = storage(4096).await;
+        storage
+            .insert_request(insert("req-1", now_ms()), vec![], vec![], None)
+            .await
+            .unwrap();
+        storage
+            .insert_replay_run(ReplayRunInsert {
+                replay_id: "rep-1".to_owned(),
+                original_request_id: "req-1".to_owned(),
+                replay_request_id: "req-replay-1".to_owned(),
+                target: "http://replay-target:4000".to_owned(),
+                method: "POST".to_owned(),
+                path: "/api/payments?mode=test".to_owned(),
+                status: Some(200),
+                latency_ms: 12,
+                error: None,
+                diff_summary: Some("original_status=500 replay_status=200".to_owned()),
+                created_at_ms: now_ms(),
+            })
+            .await
+            .unwrap();
+
+        let details = storage.show_request("req-1").await.unwrap().unwrap();
+        assert_eq!(details.replay_runs.len(), 1);
+        assert_eq!(details.replay_runs[0].replay_id, "rep-1");
+        assert_eq!(details.replay_runs[0].status, Some(200));
+        assert_eq!(
+            details.replay_runs[0].diff_summary.as_deref(),
+            Some("original_status=500 replay_status=200")
+        );
     }
 }

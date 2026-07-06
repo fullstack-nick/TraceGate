@@ -6,6 +6,7 @@ members = [
     "crates/tracegate-core",
     "crates/tracegate-observability",
     "crates/tracegate-proxy",
+    "crates/tracegate-replay",
     "crates/tracegate-storage",
     "crates/tracegate-demo-backend",
 ]

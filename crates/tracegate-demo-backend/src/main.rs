@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{OriginalUri, State},
-    http::StatusCode,
+    http::{HeaderMap, Method, StatusCode},
     routing::any,
 };
 use clap::{Parser, ValueEnum};
@@ -24,6 +24,7 @@ struct Cli {
 enum ServiceKind {
     Users,
     Payments,
+    Replay,
 }
 
 #[derive(Clone)]
@@ -34,9 +35,19 @@ struct AppState {
 #[derive(Serialize)]
 struct DemoResponse {
     service: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<String>,
     path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query: Option<String>,
     ok: bool,
     body_len: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay_request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     payload: Option<String>,
 }
@@ -68,7 +79,9 @@ async fn main() -> anyhow::Result<()> {
 
 async fn handler(
     State(state): State<AppState>,
+    method: Method,
     OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<DemoResponse>) {
     match state.service {
@@ -76,21 +89,61 @@ async fn handler(
             StatusCode::OK,
             Json(DemoResponse {
                 service: "users",
+                method: None,
                 path: uri.path().to_owned(),
+                query: None,
                 ok: true,
                 body_len: body.len(),
+                replay: None,
+                original_request_id: None,
+                replay_request_id: None,
                 payload: None,
             }),
         ),
+        ServiceKind::Replay => {
+            let replay = header_value(&headers, "x-tracegate-replay");
+            let original_request_id = header_value(&headers, "x-tracegate-original-request-id");
+            let replay_request_id = header_value(&headers, "x-request-id");
+            tracing::info!(
+                method = %method,
+                path = uri.path(),
+                query = uri.query().unwrap_or(""),
+                body_len = body.len(),
+                replay = replay.as_deref().unwrap_or(""),
+                original_request_id = original_request_id.as_deref().unwrap_or(""),
+                replay_request_id = replay_request_id.as_deref().unwrap_or(""),
+                "replay target received request"
+            );
+            (
+                StatusCode::OK,
+                Json(DemoResponse {
+                    service: "replay",
+                    method: Some(method.to_string()),
+                    path: uri.path().to_owned(),
+                    query: uri.query().map(str::to_owned),
+                    ok: true,
+                    body_len: body.len(),
+                    replay,
+                    original_request_id,
+                    replay_request_id,
+                    payload: None,
+                }),
+            )
+        }
         ServiceKind::Payments if uri.path() == "/api/payments/slow" => {
             tokio::time::sleep(std::time::Duration::from_millis(750)).await;
             (
                 StatusCode::OK,
                 Json(DemoResponse {
                     service: "payments",
+                    method: None,
                     path: uri.path().to_owned(),
+                    query: None,
                     ok: true,
                     body_len: body.len(),
+                    replay: None,
+                    original_request_id: None,
+                    replay_request_id: None,
                     payload: None,
                 }),
             )
@@ -99,9 +152,14 @@ async fn handler(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(DemoResponse {
                 service: "payments",
+                method: None,
                 path: uri.path().to_owned(),
+                query: None,
                 ok: false,
                 body_len: body.len(),
+                replay: None,
+                original_request_id: None,
+                replay_request_id: None,
                 payload: Some("x".repeat(8192)),
             }),
         ),
@@ -109,9 +167,14 @@ async fn handler(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(DemoResponse {
                 service: "payments",
+                method: None,
                 path: uri.path().to_owned(),
+                query: None,
                 ok: false,
                 body_len: body.len(),
+                replay: None,
+                original_request_id: None,
+                replay_request_id: None,
                 payload: None,
             }),
         ),
@@ -119,11 +182,23 @@ async fn handler(
             StatusCode::OK,
             Json(DemoResponse {
                 service: "payments",
+                method: None,
                 path: uri.path().to_owned(),
+                query: None,
                 ok: true,
                 body_len: body.len(),
+                replay: None,
+                original_request_id: None,
+                replay_request_id: None,
                 payload: None,
             }),
         ),
     }
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }

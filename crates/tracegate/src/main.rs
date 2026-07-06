@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
+use tracegate_replay::{ReplayOptions, ReplayOutcome, ReplaySelector};
 use tracegate_storage::{ListFilters, RequestDetails, RequestSummary, Storage, now_ms};
 
 #[derive(Debug, Parser)]
@@ -24,6 +25,20 @@ enum Command {
     Requests {
         #[command(subcommand)]
         command: RequestsCommand,
+    },
+    Replay {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        last_failed: bool,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        confirm_side_effects: bool,
+        #[arg(long)]
+        json: bool,
     },
     Storage {
         #[command(subcommand)]
@@ -156,6 +171,31 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
+        Command::Replay {
+            config,
+            id,
+            last_failed,
+            target,
+            confirm_side_effects,
+            json,
+        } => {
+            let selector = replay_selector(id, last_failed)?;
+            let storage = open_storage(&config).await?;
+            let outcome = tracegate_replay::replay(
+                &storage,
+                ReplayOptions {
+                    selector,
+                    target,
+                    confirm_side_effects,
+                },
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                print_replay_outcome(&outcome);
+            }
+        }
         Command::Storage { command } => match command {
             StorageCommand::Migrate { config } => {
                 let storage = open_storage(&config).await?;
@@ -185,6 +225,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn replay_selector(id: Option<String>, last_failed: bool) -> anyhow::Result<ReplaySelector> {
+    match (id, last_failed) {
+        (Some(id), false) => Ok(ReplaySelector::Id(id)),
+        (None, true) => Ok(ReplaySelector::LastFailed),
+        (Some(_), true) => bail!("use either --id or --last-failed, not both"),
+        (None, false) => bail!("one of --id or --last-failed is required"),
+    }
 }
 
 async fn open_storage(config: &PathBuf) -> anyhow::Result<Storage> {
@@ -315,6 +364,45 @@ fn print_request_details(details: &RequestDetails) {
     } else {
         println!("capture: none");
     }
+
+    println!("replay_runs:");
+    if details.replay_runs.is_empty() {
+        println!("  none");
+    } else {
+        for run in &details.replay_runs {
+            println!("  replay_id: {}", run.replay_id);
+            println!("    created_at_ms: {}", run.created_at_ms);
+            println!("    replay_request_id: {}", run.replay_request_id);
+            println!("    target: {}", run.target);
+            println!("    method: {}", run.method);
+            println!("    path: {}", run.path);
+            println!(
+                "    status: {}",
+                run.status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "none".to_owned())
+            );
+            println!("    latency_ms: {}", run.latency_ms);
+            println!("    error: {}", run.error.as_deref().unwrap_or("none"));
+            println!(
+                "    diff_summary: {}",
+                run.diff_summary.as_deref().unwrap_or("none")
+            );
+        }
+    }
+}
+
+fn print_replay_outcome(outcome: &ReplayOutcome) {
+    println!("replay_id: {}", outcome.replay_id);
+    println!("original_request_id: {}", outcome.original_request_id);
+    println!("replay_request_id: {}", outcome.replay_request_id);
+    println!("target: {}", outcome.target);
+    println!("method: {}", outcome.method);
+    println!("path: {}", outcome.path);
+    println!("status: {}", outcome.status);
+    println!("latency_ms: {}", outcome.latency_ms);
+    println!("response_body_bytes: {}", outcome.response_body_bytes);
+    println!("diff_summary: {}", outcome.diff_summary);
 }
 
 fn display_path(row: &RequestSummary) -> String {

@@ -250,7 +250,7 @@ fn validate_storage(raw: StorageRawConfig) -> Result<StorageConfig, ConfigError>
     let driver = raw.driver.trim().to_ascii_lowercase();
     if driver != "sqlite" {
         return Err(ConfigError::Invalid(format!(
-            "storage.driver must be `sqlite` in v0.3, got `{}`",
+            "storage.driver must be `sqlite` in v0.4, got `{}`",
             raw.driver
         )));
     }
