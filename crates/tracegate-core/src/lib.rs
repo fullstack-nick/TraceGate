@@ -29,8 +29,18 @@ pub enum CoreError {
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub listen: SocketAddr,
-    pub json_logs: bool,
+    pub admin_listen: SocketAddr,
+    pub observability: ObservabilityConfig,
     pub routes: Vec<Route>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ObservabilityConfig {
+    pub service_name: String,
+    pub environment: String,
+    pub otlp_endpoint: Option<String>,
+    pub prometheus_enabled: bool,
+    pub json_logs: bool,
 }
 
 #[derive(Clone, Debug)]

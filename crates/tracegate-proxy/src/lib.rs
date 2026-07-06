@@ -22,6 +22,8 @@ use tracegate_core::{
     AppConfig, FORWARDED_FOR_HEADER, FORWARDED_HOST_HEADER, FORWARDED_PROTO_HEADER, Route, Router,
     Upstream, request_id_from_headers, request_id_header_value,
 };
+use tracegate_observability::{RequestMetric, Telemetry};
+use tracing::{Instrument, field};
 
 type ProxyBody = BoxBody<Bytes, hyper::Error>;
 type ProxyClient = Client<HttpConnector, ProxyBody>;
@@ -36,6 +38,7 @@ pub enum ProxyError {
 struct Proxy {
     router: Arc<Router>,
     client: ProxyClient,
+    telemetry: Telemetry,
 }
 
 #[derive(Clone)]
@@ -81,20 +84,43 @@ impl RequestLogRecord {
     }
 }
 
-pub async fn serve(config: AppConfig) -> Result<(), ProxyError> {
+pub async fn serve(config: AppConfig, telemetry: Telemetry) -> Result<(), ProxyError> {
     let listener = TcpListener::bind(config.listen).await?;
-    serve_listener(listener, config, std::future::pending::<()>()).await
+    let admin_listener = TcpListener::bind(config.admin_listen).await?;
+    serve_listeners(
+        listener,
+        admin_listener,
+        config,
+        telemetry,
+        std::future::pending::<()>(),
+    )
+    .await
 }
 
 pub async fn serve_listener<S>(
     listener: TcpListener,
     config: AppConfig,
+    telemetry: Telemetry,
     shutdown: S,
 ) -> Result<(), ProxyError>
 where
     S: Future<Output = ()> + Send,
 {
-    let proxy = Proxy::new(config);
+    let admin_listener = TcpListener::bind(config.admin_listen).await?;
+    serve_listeners(listener, admin_listener, config, telemetry, shutdown).await
+}
+
+pub async fn serve_listeners<S>(
+    listener: TcpListener,
+    admin_listener: TcpListener,
+    config: AppConfig,
+    telemetry: Telemetry,
+    shutdown: S,
+) -> Result<(), ProxyError>
+where
+    S: Future<Output = ()> + Send,
+{
+    let proxy = Proxy::new(config, telemetry.clone());
     tokio::pin!(shutdown);
 
     loop {
@@ -120,6 +146,24 @@ where
                     }
                 });
             }
+            accepted = admin_listener.accept() => {
+                let (stream, _) = accepted?;
+                let telemetry = telemetry.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request| {
+                        let telemetry = telemetry.clone();
+                        async move { handle_admin_request(request, telemetry).await }
+                    });
+
+                    let io = TokioIo::new(stream);
+                    if let Err(err) = ServerBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, service)
+                        .await
+                    {
+                        tracing::warn!(error = %err, "admin connection failed");
+                    }
+                });
+            }
         }
     }
 
@@ -127,7 +171,7 @@ where
 }
 
 impl Proxy {
-    fn new(config: AppConfig) -> Self {
+    fn new(config: AppConfig, telemetry: Telemetry) -> Self {
         let mut connector = HttpConnector::new();
         connector.enforce_http(true);
         let client = Client::builder(TokioExecutor::new()).build(connector);
@@ -135,6 +179,7 @@ impl Proxy {
         Self {
             router: Arc::new(Router::new(config.routes)),
             client,
+            telemetry,
         }
     }
 
@@ -143,7 +188,6 @@ impl Proxy {
         request: Request<Incoming>,
         remote_addr: SocketAddr,
     ) -> Result<Response<ProxyBody>, Infallible> {
-        let started = Instant::now();
         let request_id = request_id_from_headers(request.headers());
         let method = request.method().clone();
         let path = request
@@ -151,6 +195,35 @@ impl Proxy {
             .path_and_query()
             .map(|path| path.as_str().to_owned())
             .unwrap_or_else(|| "/".to_owned());
+        let parent = tracegate_observability::extract_context(request.headers());
+        let span = tracing::info_span!(
+            "tracegate.request",
+            otel.kind = "server",
+            request_id = %request_id,
+            method = %method,
+            path = %path,
+            route_id = field::Empty,
+            upstream = field::Empty,
+            status = field::Empty,
+            latency_ms = field::Empty,
+            error = field::Empty,
+        );
+        tracegate_observability::set_span_parent(&span, parent);
+
+        self.handle_instrumented(request, remote_addr, request_id, method, path)
+            .instrument(span)
+            .await
+    }
+
+    async fn handle_instrumented(
+        &self,
+        request: Request<Incoming>,
+        remote_addr: SocketAddr,
+        request_id: String,
+        method: Method,
+        path: String,
+    ) -> Result<Response<ProxyBody>, Infallible> {
+        let started = Instant::now();
         let host = request
             .headers()
             .get(HOST)
@@ -163,14 +236,22 @@ impl Proxy {
                 &request_id,
             );
             self.log_request(RequestLogRecord {
-                request_id,
+                request_id: request_id.clone(),
                 method: method.to_string(),
-                path,
+                path: path.clone(),
                 route_id: None,
                 upstream: None,
                 status: response.status().as_u16(),
                 latency_ms: started.elapsed().as_millis(),
                 error: Some("no_route".to_owned()),
+            });
+            record_span_fields(None, None, response.status(), started, Some("no_route"));
+            self.telemetry.record_request(RequestMetric {
+                route_id: None,
+                method: method.to_string(),
+                status: response.status().as_u16(),
+                latency_seconds: started.elapsed().as_secs_f64(),
+                upstream_error: false,
             });
             return Ok(response);
         };
@@ -234,16 +315,33 @@ impl Proxy {
                 Some(err),
             ),
         };
+        let status = response.status();
+        let upstream_error = error.is_some() || status.is_server_error();
+        let route_id = matched.route.id;
 
         self.log_request(RequestLogRecord {
             request_id,
             method: template.method.to_string(),
             path,
-            route_id: Some(matched.route.id),
-            upstream: Some(upstream_origin),
-            status: response.status().as_u16(),
+            route_id: Some(route_id.clone()),
+            upstream: Some(upstream_origin.clone()),
+            status: status.as_u16(),
             latency_ms: started.elapsed().as_millis(),
-            error,
+            error: error.clone(),
+        });
+        record_span_fields(
+            Some(&route_id),
+            Some(&upstream_origin),
+            status,
+            started,
+            error.as_deref(),
+        );
+        self.telemetry.record_request(RequestMetric {
+            route_id: Some(route_id),
+            method: template.method.to_string(),
+            status: status.as_u16(),
+            latency_seconds: started.elapsed().as_secs_f64(),
+            upstream_error,
         });
 
         Ok(response)
@@ -352,8 +450,57 @@ fn build_upstream_request(
         HeaderName::from_static(FORWARDED_PROTO_HEADER),
         HeaderValue::from_static("http"),
     );
+    tracegate_observability::inject_context(request.headers_mut());
 
     Ok(request)
+}
+
+async fn handle_admin_request(
+    request: Request<Incoming>,
+    telemetry: Telemetry,
+) -> Result<Response<ProxyBody>, Infallible> {
+    let response = match (request.method(), request.uri().path()) {
+        (&Method::GET, "/health/live") => text_response(StatusCode::OK, "live\n"),
+        (&Method::GET, "/health/ready") => text_response(StatusCode::OK, "ready\n"),
+        (&Method::GET, "/metrics") if telemetry.prometheus_enabled() => {
+            match telemetry.render_prometheus() {
+                Ok(metrics) => response_with_content_type(
+                    StatusCode::OK,
+                    "application/openmetrics-text; version=1.0.0; charset=utf-8",
+                    metrics,
+                ),
+                Err(err) => text_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to render metrics: {err}\n"),
+                ),
+            }
+        }
+        (&Method::GET, "/metrics") => text_response(StatusCode::NOT_FOUND, "metrics disabled\n"),
+        _ => text_response(StatusCode::NOT_FOUND, "not found\n"),
+    };
+
+    Ok(response)
+}
+
+fn record_span_fields(
+    route_id: Option<&str>,
+    upstream: Option<&str>,
+    status: StatusCode,
+    started: Instant,
+    error: Option<&str>,
+) {
+    let span = tracing::Span::current();
+    if let Some(route_id) = route_id {
+        span.record("route_id", route_id);
+    }
+    if let Some(upstream) = upstream {
+        span.record("upstream", upstream);
+    }
+    span.record("status", status.as_u16());
+    span.record("latency_ms", started.elapsed().as_millis());
+    if let Some(error) = error {
+        span.record("error", error);
+    }
 }
 
 fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
@@ -389,6 +536,28 @@ fn full_body(body: &'static str) -> ProxyBody {
     Full::new(Bytes::from_static(body.as_bytes()))
         .map_err(|never| match never {})
         .boxed()
+}
+
+fn text_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
+    response_with_content_type(status, "text/plain; charset=utf-8", body.to_owned())
+}
+
+fn response_with_content_type(
+    status: StatusCode,
+    content_type: &'static str,
+    body: String,
+) -> Response<ProxyBody> {
+    let mut response = Response::new(
+        Full::new(Bytes::from(body))
+            .map_err(|never| match never {})
+            .boxed(),
+    );
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type),
+    );
+    response
 }
 
 fn header_value(value: &str) -> Result<HeaderValue, AttemptError> {

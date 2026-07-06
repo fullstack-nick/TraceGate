@@ -2,7 +2,7 @@ use std::{collections::HashSet, fs, net::SocketAddr, path::Path, time::Duration}
 
 use serde::Deserialize;
 use thiserror::Error;
-use tracegate_core::{AppConfig, Route, Upstream};
+use tracegate_core::{AppConfig, ObservabilityConfig, Route, Upstream};
 use url::Url;
 
 #[derive(Debug, Error)]
@@ -29,24 +29,45 @@ pub struct RawConfig {
     #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
+    pub observability: ObservabilityRawConfig,
+    #[serde(default)]
     pub routes: Vec<RouteConfig>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
     pub listen: String,
+    #[serde(default)]
+    pub admin_listen: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct LoggingConfig {
+    pub json: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct LoggingConfig {
-    #[serde(default = "default_json_logging")]
-    pub json: bool,
+pub struct ObservabilityRawConfig {
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+    #[serde(default = "default_environment")]
+    pub environment: String,
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    #[serde(default = "default_prometheus_enabled")]
+    pub prometheus_enabled: bool,
+    #[serde(default)]
+    pub json_logs: Option<bool>,
 }
 
-impl Default for LoggingConfig {
+impl Default for ObservabilityRawConfig {
     fn default() -> Self {
         Self {
-            json: default_json_logging(),
+            service_name: default_service_name(),
+            environment: default_environment(),
+            otlp_endpoint: None,
+            prometheus_enabled: default_prometheus_enabled(),
+            json_logs: None,
         }
     }
 }
@@ -84,6 +105,13 @@ impl RawConfig {
             .listen
             .parse()
             .map_err(|err| ConfigError::Invalid(format!("server.listen: {err}")))?;
+        let admin_listen: SocketAddr = self
+            .server
+            .admin_listen
+            .unwrap_or_else(default_admin_listen)
+            .parse()
+            .map_err(|err| ConfigError::Invalid(format!("server.admin_listen: {err}")))?;
+        let observability = validate_observability(self.logging, self.observability)?;
 
         if self.routes.is_empty() {
             return Err(ConfigError::Invalid(
@@ -145,10 +173,60 @@ impl RawConfig {
 
         Ok(AppConfig {
             listen,
-            json_logs: self.logging.json,
+            admin_listen,
+            observability,
             routes,
         })
     }
+}
+
+fn validate_observability(
+    logging: LoggingConfig,
+    raw: ObservabilityRawConfig,
+) -> Result<ObservabilityConfig, ConfigError> {
+    let service_name = raw.service_name.trim().to_owned();
+    if service_name.is_empty() {
+        return Err(ConfigError::Invalid(
+            "observability.service_name cannot be empty".to_owned(),
+        ));
+    }
+
+    let environment = raw.environment.trim().to_owned();
+    if environment.is_empty() {
+        return Err(ConfigError::Invalid(
+            "observability.environment cannot be empty".to_owned(),
+        ));
+    }
+
+    let otlp_endpoint = raw
+        .otlp_endpoint
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let parsed = Url::parse(&value).map_err(|err| {
+                ConfigError::Invalid(format!("observability.otlp_endpoint `{value}`: {err}"))
+            })?;
+            match parsed.scheme() {
+                "http" | "https" => Ok(value),
+                scheme => Err(ConfigError::Invalid(format!(
+                    "observability.otlp_endpoint `{value}` must use http or https, got `{scheme}`"
+                ))),
+            }
+        })
+        .transpose()?;
+
+    let json_logs = raw
+        .json_logs
+        .or(logging.json)
+        .unwrap_or_else(default_json_logging);
+
+    Ok(ObservabilityConfig {
+        service_name,
+        environment,
+        otlp_endpoint,
+        prometheus_enabled: raw.prometheus_enabled,
+        json_logs,
+    })
 }
 
 fn validate_route_id(id: &str) -> Result<(), ConfigError> {
@@ -240,6 +318,22 @@ fn default_json_logging() -> bool {
     true
 }
 
+fn default_admin_listen() -> String {
+    "127.0.0.1:9090".to_owned()
+}
+
+fn default_service_name() -> String {
+    "tracegate".to_owned()
+}
+
+fn default_environment() -> String {
+    "local".to_owned()
+}
+
+fn default_prometheus_enabled() -> bool {
+    true
+}
+
 fn default_timeout_ms() -> u64 {
     3000
 }
@@ -252,8 +346,10 @@ mod tests {
         RawConfig {
             server: ServerConfig {
                 listen: "127.0.0.1:8080".to_owned(),
+                admin_listen: None,
             },
-            logging: LoggingConfig { json: true },
+            logging: LoggingConfig { json: Some(true) },
+            observability: ObservabilityRawConfig::default(),
             routes: vec![RouteConfig {
                 id: "users".to_owned(),
                 hosts: vec!["*".to_owned()],
@@ -270,7 +366,73 @@ mod tests {
         let config = valid_raw_config().validate().unwrap();
 
         assert_eq!(config.listen.to_string(), "127.0.0.1:8080");
+        assert_eq!(config.admin_listen.to_string(), "127.0.0.1:9090");
+        assert_eq!(config.observability.service_name, "tracegate");
+        assert!(config.observability.prometheus_enabled);
         assert_eq!(config.routes.len(), 1);
+    }
+
+    #[test]
+    fn parses_v2_observability_config() {
+        let raw = r#"
+[server]
+listen = "127.0.0.1:8080"
+admin_listen = "127.0.0.1:9091"
+
+[observability]
+service_name = "tracegate-test"
+environment = "test"
+otlp_endpoint = "http://otel-collector:4317"
+prometheus_enabled = true
+json_logs = false
+
+[[routes]]
+id = "users"
+hosts = ["*"]
+path_prefix = "/api/users"
+upstreams = ["http://users-service:3000"]
+"#;
+
+        let config = toml::from_str::<RawConfig>(raw)
+            .unwrap()
+            .validate()
+            .unwrap();
+
+        assert_eq!(config.admin_listen.to_string(), "127.0.0.1:9091");
+        assert_eq!(config.observability.service_name, "tracegate-test");
+        assert_eq!(config.observability.environment, "test");
+        assert_eq!(
+            config.observability.otlp_endpoint.as_deref(),
+            Some("http://otel-collector:4317")
+        );
+        assert!(!config.observability.json_logs);
+    }
+
+    #[test]
+    fn rejects_invalid_admin_listen() {
+        let mut raw = valid_raw_config();
+        raw.server.admin_listen = Some("not-an-address".to_owned());
+
+        let err = raw.validate().unwrap_err().to_string();
+        assert!(err.contains("server.admin_listen"));
+    }
+
+    #[test]
+    fn rejects_empty_service_name() {
+        let mut raw = valid_raw_config();
+        raw.observability.service_name = " ".to_owned();
+
+        let err = raw.validate().unwrap_err().to_string();
+        assert!(err.contains("observability.service_name"));
+    }
+
+    #[test]
+    fn rejects_malformed_otlp_endpoint() {
+        let mut raw = valid_raw_config();
+        raw.observability.otlp_endpoint = Some("otel-collector:4317".to_owned());
+
+        let err = raw.validate().unwrap_err().to_string();
+        assert!(err.contains("observability.otlp_endpoint"));
     }
 
     #[test]

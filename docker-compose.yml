@@ -8,9 +8,11 @@ services:
     command: ["tracegate", "serve", "--config", "/etc/tracegate/tracegate.toml"]
     ports:
       - "8080:8080"
+      - "9090:9090"
     volumes:
       - ./examples/tracegate.toml:/etc/tracegate/tracegate.toml:ro
     depends_on:
+      - otel-collector
       - users-service
       - payments-service
 
@@ -25,3 +27,28 @@ services:
     command: ["tracegate-demo-backend", "--service", "payments", "--listen", "0.0.0.0:4000"]
     expose:
       - "4000"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.155.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./deployments/gcp/compose/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.19.0
+    ports:
+      - "16686:16686"
+
+  prometheus:
+    image: prom/prometheus:v3.13.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=2h"
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./deployments/gcp/compose/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - tracegate

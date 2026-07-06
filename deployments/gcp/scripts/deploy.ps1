@@ -29,6 +29,8 @@ gcloud compute ssh $VmName --zone $Zone --command "sudo mkdir -p /opt/tracegate 
 gcloud compute scp $tarPath "${VmName}:/opt/tracegate/tracegate.tar" --zone $Zone
 gcloud compute scp "$repo\deployments\gcp\compose\docker-compose.yml" "${VmName}:/opt/tracegate/docker-compose.yml" --zone $Zone
 gcloud compute scp "$repo\deployments\gcp\compose\tracegate.toml" "${VmName}:/opt/tracegate/tracegate.toml" --zone $Zone
+gcloud compute scp "$repo\deployments\gcp\compose\otel-collector.yaml" "${VmName}:/opt/tracegate/otel-collector.yaml" --zone $Zone
+gcloud compute scp "$repo\deployments\gcp\compose\prometheus.yml" "${VmName}:/opt/tracegate/prometheus.yml" --zone $Zone
 gcloud compute scp "$repo\deployments\gcp\systemd\tracegate.service" "${VmName}:/tmp/tracegate.service" --zone $Zone
 gcloud compute scp $envPath "${VmName}:/opt/tracegate/current.env.next" --zone $Zone
 

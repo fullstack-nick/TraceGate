@@ -16,6 +16,7 @@ serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracegate-core = { path = "../tracegate-core" }
+tracegate-observability = { path = "../tracegate-observability" }
 tracing.workspace = true
 
 [dev-dependencies]

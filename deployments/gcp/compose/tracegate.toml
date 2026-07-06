@@ -1,8 +1,16 @@
 [server]
 listen = "0.0.0.0:8080"
+admin_listen = "0.0.0.0:9090"
 
 [logging]
 json = true
+
+[observability]
+service_name = "tracegate"
+environment = "gcp-v0.2"
+otlp_endpoint = "http://otel-collector:4317"
+prometheus_enabled = true
+json_logs = true
 
 [[routes]]
 id = "users"

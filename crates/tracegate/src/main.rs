@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Debug, Parser)]
 #[command(name = "tracegate", version, about = "Rust observability API gateway")]
@@ -39,8 +38,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve { config } => {
             let config = tracegate_config::load_config(&config)
                 .with_context(|| format!("failed to load {}", config.display()))?;
-            init_logging(config.json_logs);
-            tracegate_proxy::serve(config).await?;
+            let observability = tracegate_observability::init(&config.observability)?;
+            tracegate_proxy::serve(config, observability.telemetry()).await?;
+            observability.shutdown();
         }
         Command::Config {
             command: ConfigCommand::Check { config },
@@ -48,26 +48,14 @@ async fn main() -> anyhow::Result<()> {
             let config = tracegate_config::load_config(&config)
                 .with_context(|| format!("failed to load {}", config.display()))?;
             println!(
-                "config ok: listen={}, routes={}",
+                "config ok: listen={}, admin_listen={}, routes={}, prometheus={}",
                 config.listen,
-                config.routes.len()
+                config.admin_listen,
+                config.routes.len(),
+                config.observability.prometheus_enabled
             );
         }
     }
 
     Ok(())
-}
-
-fn init_logging(json: bool) {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-
-    if json {
-        fmt()
-            .with_env_filter(env_filter)
-            .json()
-            .flatten_event(true)
-            .init();
-    } else {
-        fmt().with_env_filter(env_filter).init();
-    }
 }

@@ -9,6 +9,7 @@ services:
     volumes:
       - /opt/tracegate/tracegate.toml:/etc/tracegate/tracegate.toml:ro
     depends_on:
+      - otel-collector
       - users-service
       - payments-service
 
@@ -27,3 +28,33 @@ services:
     restart: unless-stopped
     expose:
       - "4000"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.155.0
+    container_name: tracegate-otel-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    restart: unless-stopped
+    volumes:
+      - /opt/tracegate/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.19.0
+    container_name: tracegate-jaeger
+    restart: unless-stopped
+    expose:
+      - "16686"
+      - "4317"
+
+  prometheus:
+    image: prom/prometheus:v3.13.0
+    container_name: tracegate-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=2h"
+    restart: unless-stopped
+    volumes:
+      - /opt/tracegate/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - tracegate
