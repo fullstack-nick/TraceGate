@@ -28,4 +28,4 @@ $remoteCommand = $remoteCommand.Replace("__REQUEST_ID__", $RequestId)
 $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($remoteCommand))
 $launcher = "printf '%s' '$encodedCommand' | base64 -d | bash"
 
-gcloud compute ssh $VmName --zone $Zone --command "$launcher"
+gcloud compute ssh $VmName --zone $Zone --strict-host-key-checking=no --quiet --command "$launcher"

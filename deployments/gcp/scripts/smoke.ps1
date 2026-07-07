@@ -16,7 +16,7 @@ if ([string]::IsNullOrWhiteSpace($ip)) {
     throw "no external IP found for $VmName"
 }
 $caPath = Join-Path $scratch "tracegate-ca.crt"
-gcloud compute scp "${VmName}:/opt/tracegate/tls/ca.crt" $caPath --zone $Zone
+gcloud compute scp "${VmName}:/opt/tracegate/tls/ca.crt" $caPath --zone $Zone --strict-host-key-checking=no --quiet
 $curlTlsArgs = @("--cacert", $caPath)
 if ((curl.exe -V) -match "Schannel") {
     $curlTlsArgs += "--ssl-no-revoke"
@@ -80,7 +80,7 @@ docker logs tracegate-replay-target --tail 100
 
 $encodedReplayCommand = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($replayCommand))
 $replayLauncher = "printf '%s' '$encodedReplayCommand' | base64 -d | bash"
-gcloud compute ssh $VmName --zone $Zone --command "$replayLauncher"
-gcloud compute ssh $VmName --zone $Zone --command "docker logs tracegate --tail 100"
+gcloud compute ssh $VmName --zone $Zone --strict-host-key-checking=no --quiet --command "$replayLauncher"
+gcloud compute ssh $VmName --zone $Zone --strict-host-key-checking=no --quiet --command "docker logs tracegate --tail 100"
 & "$scriptRoot\inspect-observability.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName
 & "$scriptRoot\inspect-captures.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName

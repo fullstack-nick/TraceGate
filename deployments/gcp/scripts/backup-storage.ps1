@@ -33,6 +33,6 @@ $encodedRemoteCommand = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes
 $remoteLauncher = "printf '%s' '$encodedRemoteCommand' | base64 -d | bash"
 
 gcloud compute ssh $VmName --zone $Zone --strict-host-key-checking=no --quiet --command $remoteLauncher
-gcloud compute scp "${VmName}:${remotePath}" (Join-Path $scratch $OutputName) --zone $Zone
+gcloud compute scp "${VmName}:${remotePath}" (Join-Path $scratch $OutputName) --zone $Zone --strict-host-key-checking=no --quiet
 
 Write-Host "Downloaded capture-store backup to $(Join-Path $scratch $OutputName)"

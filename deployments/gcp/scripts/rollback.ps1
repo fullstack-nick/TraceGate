@@ -17,4 +17,4 @@ sudo systemctl restart tracegate
 sudo systemctl --no-pager --full status tracegate
 '@
 
-gcloud compute ssh $VmName --zone $Zone --command $remoteCommand
+gcloud compute ssh $VmName --zone $Zone --strict-host-key-checking=no --quiet --command $remoteCommand

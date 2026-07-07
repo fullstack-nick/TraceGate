@@ -33,24 +33,24 @@ function Invoke-TerraformApply {
         [switch] $LoadGeneratorEnabled
     )
 
-    $tfArgs = @(
-        "-ProjectId", $ProjectId,
-        "-Region", $Region,
-        "-Zone", $Zone,
-        "-MachineType", $MachineType,
-        "-DiskSizeGb", 30
-    )
+    $tfArgs = @{
+        ProjectId = $ProjectId
+        Region = $Region
+        Zone = $Zone
+        MachineType = $MachineType
+        DiskSizeGb = 30
+    }
     if (-not [string]::IsNullOrWhiteSpace($OperatorCidr)) {
-        $tfArgs += @("-OperatorCidr", $OperatorCidr)
+        $tfArgs.OperatorCidr = $OperatorCidr
     }
     if ($ReleaseQuality) {
-        $tfArgs += "-ReleaseQuality"
+        $tfArgs.ReleaseQuality = $true
     }
     if ($LoadGeneratorEnabled) {
-        $tfArgs += "-LoadGeneratorEnabled"
+        $tfArgs.LoadGeneratorEnabled = $true
     }
     if ($AutoApprove) {
-        $tfArgs += "-AutoApprove"
+        $tfArgs.AutoApprove = $true
     }
 
     & "$scriptRoot\terraform-apply.ps1" @tfArgs

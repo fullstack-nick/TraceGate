@@ -9,4 +9,4 @@ $ErrorActionPreference = "Stop"
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 & "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Zone $Zone
 
-gcloud compute ssh $VmName --zone $Zone --command "sudo journalctl -u tracegate -n $Tail --no-pager; docker logs tracegate --tail $Tail"
+gcloud compute ssh $VmName --zone $Zone --strict-host-key-checking=no --quiet --command "sudo journalctl -u tracegate -n $Tail --no-pager; docker logs tracegate --tail $Tail"
