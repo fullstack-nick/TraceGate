@@ -51,6 +51,9 @@ try {
         $applyArgs += "-auto-approve"
     }
     terraform @applyArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "terraform apply failed with exit code $LASTEXITCODE"
+    }
 } finally {
     Pop-Location
 }

@@ -101,7 +101,7 @@ fi
 printf '%s' "$TRACEGATE_ADMIN_TOKEN" > /opt/tracegate/admin-token
 sudo chown root:65534 /opt/tracegate/admin-token || true
 sudo chmod 640 /opt/tracegate/admin-token
-if [ ! -f /opt/tracegate/tls/ca.crt ] || [ ! -f /opt/tracegate/tls/tracegate.crt ] || [ ! -f /opt/tracegate/tls/upstreams.crt ]; then
+if [ ! -f /opt/tracegate/tls/ca.crt ] || [ ! -f /opt/tracegate/tls/tracegate.crt ] || [ ! -f /opt/tracegate/tls/upstreams.crt ] || ! openssl x509 -in /opt/tracegate/tls/tracegate.crt -noout -ext subjectAltName | grep -F "IP Address:__TRACEGATE_PUBLIC_IP__" >/dev/null 2>&1; then
   rm -f /opt/tracegate/tls/*.crt /opt/tracegate/tls/*.key /opt/tracegate/tls/*.csr /opt/tracegate/tls/*.cnf /opt/tracegate/tls/*.srl
   openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
     -keyout /opt/tracegate/tls/ca.key \
@@ -154,6 +154,16 @@ sudo mv /tmp/tracegate.service /etc/systemd/system/tracegate.service
 sudo systemctl daemon-reload
 sudo systemctl enable tracegate
 sudo systemctl restart tracegate
+for i in $(seq 1 60); do
+  if curl -fsS --connect-to tracegate:8080:127.0.0.1:8080 --cacert /opt/tracegate/tls/ca.crt https://tracegate:8080/api/users/123 >/dev/null 2>&1; then
+    break
+  fi
+  if [ "$i" -eq 60 ]; then
+    echo "TraceGate did not become ready after deploy" >&2
+    exit 1
+  fi
+  sleep 2
+done
 sudo systemctl --no-pager --full status tracegate
 '@
 
