@@ -5,6 +5,9 @@ param(
     [string] $MachineType = "e2-micro",
     [int] $DiskSizeGb = 30,
     [string] $OperatorCidr = "",
+    [switch] $ReleaseQuality,
+    [switch] $LoadGeneratorEnabled,
+    [string] $LoadGeneratorMachineType = "n2-standard-8",
     [switch] $AutoApprove
 )
 
@@ -17,11 +20,21 @@ if ([string]::IsNullOrWhiteSpace($OperatorCidr)) {
     $OperatorCidr = "$ip/32"
 }
 
-& "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Region $Region -Zone $Zone -MachineType $MachineType -DiskSizeGb $DiskSizeGb
+& "$scriptRoot\guard.ps1" `
+    -ProjectId $ProjectId `
+    -Region $Region `
+    -Zone $Zone `
+    -MachineType $MachineType `
+    -DiskSizeGb $DiskSizeGb `
+    -ReleaseQuality:$ReleaseQuality `
+    -LoadGeneratorEnabled:$LoadGeneratorEnabled `
+    -LoadGeneratorMachineType $LoadGeneratorMachineType
 
 Push-Location $terraformDir
 try {
     terraform init
+    $releaseQualityValue = if ($ReleaseQuality) { "true" } else { "false" }
+    $loadGeneratorValue = if ($LoadGeneratorEnabled) { "true" } else { "false" }
     $applyArgs = @(
         "apply",
         "-var", "project_id=$ProjectId",
@@ -29,7 +42,10 @@ try {
         "-var", "zone=$Zone",
         "-var", "machine_type=$MachineType",
         "-var", "disk_size_gb=$DiskSizeGb",
-        "-var", "ssh_source_cidr=$OperatorCidr"
+        "-var", "ssh_source_cidr=$OperatorCidr",
+        "-var", "release_quality_mode=$releaseQualityValue",
+        "-var", "load_generator_enabled=$loadGeneratorValue",
+        "-var", "load_generator_machine_type=$LoadGeneratorMachineType"
     )
     if ($AutoApprove) {
         $applyArgs += "-auto-approve"

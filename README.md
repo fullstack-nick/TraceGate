@@ -2,7 +2,7 @@
 
 TraceGate is a Rust observability API gateway that routes HTTP traffic, records failure evidence, replays captured requests, and runs sandboxed request-policy plugins.
 
-v0.7 provides the gateway foundation, observability, SQLite demo storage, PostgreSQL production storage, safe replay, a sandboxed WASM `before_request` policy hook, production-mode hardening, and the TraceGate Console/full demo path:
+v1.0 release quality covers the gateway foundation, observability, SQLite demo storage, PostgreSQL production storage, safe replay, a sandboxed WASM `before_request` policy hook, production-mode hardening, the TraceGate Console/full demo path, CI, benchmark smoke, live verification, and GCP stress proof:
 
 - host and path-prefix routing
 - Hyper-based reverse proxying
@@ -36,6 +36,7 @@ v0.7 provides the gateway foundation, observability, SQLite demo storage, Postgr
 - local Docker Compose demo with users, payments, a safe replay target, OpenTelemetry Collector, Jaeger, and Prometheus
 - repeatable local and GCP full-demo scripts
 - Terraform and SSH-based GCP Compute Engine deployment assets with production-mode HTTPS/PostgreSQL Compose
+- v1 release-quality scripts for temporary `n2-standard-16` app verification, `n2-standard-8` load generation, restart/rollback proof, and cleanup back to `e2-micro`
 
 ## Local Demo
 
@@ -135,6 +136,22 @@ deployments/gcp/scripts/inspect-replay.ps1
 deployments/gcp/scripts/backup-storage.ps1
 deployments/gcp/scripts/inspect-observability.ps1
 deployments/gcp/scripts/logs.ps1
+deployments/gcp/scripts/v1-infra.ps1 -Action BaselineUp -AutoApprove
+deployments/gcp/scripts/v1-live-verify.ps1
+deployments/gcp/scripts/v1-infra.ps1 -Action LoadGenUp -AutoApprove
+deployments/gcp/scripts/v1-stress.ps1 -Duration 1h
+deployments/gcp/scripts/v1-infra.ps1 -Action Cleanup -AutoApprove
 ```
 
 The guard script refuses to deploy unless the active account is `nickaccturk@gmail.com` and the active project is a dedicated `tracegate-*` project. Only TraceGate's public data-plane port `8080` is exposed by Terraform; production traffic on that port is HTTPS. Admin, Console, PostgreSQL, Grafana, telemetry services, and the replay target are inspected over SSH inside the VM.
+
+## Release Quality
+
+Additional release references:
+
+- [Security model](SECURITY.md)
+- [Benchmark and stress gate](BENCHMARKS.md)
+- [Architecture diagram](docs/ARCHITECTURE.md)
+- [Plugin authoring guide](docs/PLUGIN_AUTHORING.md)
+
+The v1 release-quality path intentionally uses larger VMs only during verification. The required end state after v1 proof is the app VM resized back to `e2-micro` and the temporary load generator deleted.

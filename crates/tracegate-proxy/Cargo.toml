@@ -33,6 +33,11 @@ tracing.workspace = true
 webpki-roots.workspace = true
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 reqwest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "release_overhead"
+harness = false

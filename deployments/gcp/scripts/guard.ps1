@@ -4,7 +4,10 @@ param(
     [string] $Region = "us-central1",
     [string] $Zone = "us-central1-a",
     [string] $MachineType = "e2-micro",
-    [int] $DiskSizeGb = 30
+    [int] $DiskSizeGb = 30,
+    [switch] $ReleaseQuality,
+    [switch] $LoadGeneratorEnabled,
+    [string] $LoadGeneratorMachineType = "n2-standard-8"
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,8 +43,21 @@ if ($Zone -ne "us-central1-a") {
     Fail "v0.1 is locked to us-central1-a, got '$Zone'"
 }
 
-if ($MachineType -ne "e2-micro") {
-    Fail "v0.1 is locked to e2-micro, got '$MachineType'"
+if ($ReleaseQuality) {
+    if ($MachineType -notin @("e2-micro", "n2-standard-16")) {
+        Fail "release-quality app VM must be e2-micro or n2-standard-16, got '$MachineType'"
+    }
+} elseif ($MachineType -ne "e2-micro") {
+    Fail "large app VM '$MachineType' requires -ReleaseQuality"
+}
+
+if ($LoadGeneratorEnabled) {
+    if (-not $ReleaseQuality) {
+        Fail "load generator creation requires -ReleaseQuality"
+    }
+    if ($LoadGeneratorMachineType -ne "n2-standard-8") {
+        Fail "v1 load generator is locked to n2-standard-8, got '$LoadGeneratorMachineType'"
+    }
 }
 
 if ($DiskSizeGb -ne 30) {
@@ -56,3 +72,5 @@ Write-Host "  project: $ProjectId"
 Write-Host "  region:  $Region"
 Write-Host "  zone:    $Zone"
 Write-Host "  vm:      $MachineType / ${DiskSizeGb}GB pd-standard"
+Write-Host "  release-quality: $([bool] $ReleaseQuality)"
+Write-Host "  load-generator:  $([bool] $LoadGeneratorEnabled) $LoadGeneratorMachineType"
