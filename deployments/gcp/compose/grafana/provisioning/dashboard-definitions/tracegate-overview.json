@@ -1,0 +1,259 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "tracegate-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "targets": [
+        {
+          "expr": "sum by (route_id, status) (rate(tracegate_requests_total[5m]))",
+          "legendFormat": "{{route_id}} {{status}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Request Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "tracegate-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, route_id) (rate(tracegate_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{route_id}} p95",
+          "refId": "A"
+        }
+      ],
+      "title": "Request Latency p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "tracegate-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 7
+      },
+      "id": 3,
+      "targets": [
+        {
+          "expr": "sum by (route_id, status) (increase(tracegate_upstream_errors_total[15m]))",
+          "legendFormat": "{{route_id}} {{status}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Upstream Errors",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "tracegate-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 7
+      },
+      "id": 4,
+      "targets": [
+        {
+          "expr": "tracegate_captures_total",
+          "legendFormat": "captures",
+          "refId": "A"
+        },
+        {
+          "expr": "tracegate_capture_dropped_total",
+          "legendFormat": "capture drops",
+          "refId": "B"
+        }
+      ],
+      "title": "Capture Store",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "tracegate-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 7
+      },
+      "id": 5,
+      "targets": [
+        {
+          "expr": "sum by (plugin_id, action, outcome) (increase(tracegate_plugin_decisions_total[15m]))",
+          "legendFormat": "{{plugin_id}} {{action}} {{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Plugin Decisions",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "tracegate-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 14
+      },
+      "id": 6,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, plugin_id) (rate(tracegate_plugin_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{plugin_id}} p95",
+          "refId": "A"
+        }
+      ],
+      "title": "Plugin Duration p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "tracegate-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 14
+      },
+      "id": 7,
+      "targets": [
+        {
+          "expr": "sum by (plugin_id, route_id) (tracegate_plugin_timeouts_total)",
+          "legendFormat": "{{plugin_id}} {{route_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Plugin Timeouts",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "tracegate-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 14
+      },
+      "id": 8,
+      "targets": [
+        {
+          "expr": "sum by (plugin_id, route_id) (tracegate_plugin_errors_total)",
+          "legendFormat": "{{plugin_id}} {{route_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Plugin Errors",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": [
+    "tracegate"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "TraceGate Overview",
+  "uid": "tracegate-overview",
+  "version": 1,
+  "weekStart": ""
+}

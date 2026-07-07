@@ -2,7 +2,7 @@
 
 TraceGate is a Rust observability API gateway that routes HTTP traffic, records failure evidence, replays captured requests, and runs sandboxed request-policy plugins.
 
-v0.6 provides the gateway foundation, observability, SQLite demo storage, PostgreSQL production storage, safe replay, a sandboxed WASM `before_request` policy hook, and production-mode hardening:
+v0.7 provides the gateway foundation, observability, SQLite demo storage, PostgreSQL production storage, safe replay, a sandboxed WASM `before_request` policy hook, production-mode hardening, and the TraceGate Console/full demo path:
 
 - host and path-prefix routing
 - Hyper-based reverse proxying
@@ -26,15 +26,21 @@ v0.6 provides the gateway foundation, observability, SQLite demo storage, Postgr
 - `/health/live` and `/health/ready`
 - bearer-authenticated admin endpoints when an admin token is configured
 - `POST /admin/reload` for atomic route/plugin/redaction/capture hot reloads
+- read-only TraceGate Console on the admin listener at `/console/`
+- bearer-protected admin JSON APIs under `/admin/api/*`
+- route health, recent request, request detail, replay run, plugin decision, plugin summary, and telemetry status views
+- provisioned Grafana `TraceGate Overview` dashboard
 - rustls data-plane TLS and HTTPS upstream verification in production mode
 - per-route timeouts, retry configuration, concurrency limits, and passive upstream health
 - bounded capture persistence with drop accounting under backpressure
 - local Docker Compose demo with users, payments, a safe replay target, OpenTelemetry Collector, Jaeger, and Prometheus
+- repeatable local and GCP full-demo scripts
 - Terraform and SSH-based GCP Compute Engine deployment assets with production-mode HTTPS/PostgreSQL Compose
 
 ## Local Demo
 
 ```powershell
+$adminToken = "tracegate-local-admin"
 docker compose up --build
 curl.exe -i http://localhost:8080/api/users/123
 curl.exe -i http://localhost:8080/api/payments/fail
@@ -42,8 +48,11 @@ curl.exe -i http://localhost:8080/api/plugin-timeout/proof
 curl.exe -i -H "x-api-key: tracegate-demo-key" http://localhost:8080/api/payments/fail
 curl.exe -i -H "x-api-key: tracegate-demo-key" "http://localhost:8080/api/payments/slow?token=secret&visible=yes"
 curl.exe -i -X POST -H "x-api-key: tracegate-demo-key" -H "content-type: application/json" -H "authorization: Bearer secret" --data "{\"card\":\"4242\",\"note\":\"capture proof\"}" "http://localhost:8080/api/payments/large-fail?api_key=secret&visible=yes"
-curl.exe -s http://localhost:9090/health/live
-curl.exe -s http://localhost:9090/metrics
+curl.exe -s -H "Authorization: Bearer $adminToken" http://localhost:9090/health/live
+curl.exe -s -H "Authorization: Bearer $adminToken" http://localhost:9090/metrics
+curl.exe -s http://localhost:9090/console/
+curl.exe -s -H "Authorization: Bearer $adminToken" http://localhost:9090/admin/api/overview
+curl.exe -s -H "Authorization: Bearer $adminToken" "http://localhost:9090/admin/api/requests?failed=true&limit=10"
 docker logs tracegate-tracegate-1 --tail 50
 docker compose exec tracegate tracegate plugins inspect /usr/local/share/tracegate/plugins/api-key-guard.wasm
 docker compose exec tracegate tracegate requests list --config /etc/tracegate/tracegate.toml --failed
@@ -51,6 +60,7 @@ docker compose exec tracegate tracegate requests list --config /etc/tracegate/tr
 docker compose exec tracegate tracegate replay --config /etc/tracegate/tracegate.toml --last-failed --target http://replay-target:4000 --confirm-side-effects
 docker compose exec tracegate tracegate requests show --config /etc/tracegate/tracegate.toml --id <request-id>
 docker compose logs replay-target --tail 50
+scripts\full-demo.ps1
 ```
 
 Expected behavior:
@@ -69,7 +79,9 @@ Expected behavior:
 - Stored query strings omit configured sensitive params such as `token`, `access_token`, and `api_key`; stored headers omit configured sensitive headers such as `authorization`, `cookie`, `set-cookie`, and `x-api-key`.
 - Replaying a captured failed payment request sends it to the safe replay target, adds replay metadata headers, and persists a replay audit record.
 - Mutating replay methods require `--confirm-side-effects`.
-- Jaeger is available locally at `http://localhost:16686`; Prometheus is available locally at `http://localhost:9091`.
+- TraceGate Console is available locally at `http://localhost:9090/console/`; enter `tracegate-local-admin` as the bearer token.
+- Jaeger is available locally at `http://localhost:16686`; Prometheus is available locally at `http://localhost:9091`; Grafana is available locally at `http://localhost:3000`.
+- `scripts\full-demo.ps1` verifies the local console APIs, route health, plugin summaries, telemetry status, replay-run display, plugin-deny display, and Grafana dashboard provisioning.
 
 ## Local Production Mode
 
@@ -106,9 +118,9 @@ The live deployment path is intentionally direct-control:
 - dedicated TraceGate GCP project
 - Terraform-managed `e2-micro` Compute Engine VM in `us-central1-a`
 - Docker Compose under systemd with TraceGate, demo backends, a safe internal replay target, OpenTelemetry Collector, Jaeger, and Prometheus
-- production mode uses HTTPS on the public TraceGate listener, internal PostgreSQL, generated private CA material, HTTPS demo upstreams, and bearer-authenticated admin inspection over the VM Docker network
+- production mode uses HTTPS on the public TraceGate listener, internal PostgreSQL, generated private CA material, HTTPS demo upstreams, Grafana dashboard provisioning, and bearer-authenticated admin/console inspection over the VM Docker network
 - local image build, `docker save`, `gcloud compute scp`, VM-side `docker load`
-- live HTTPS `curl --cacert` smoke plus SSH telemetry/log/storage inspection
+- live HTTPS `curl --cacert` smoke plus SSH console/API/Grafana/telemetry/log/storage inspection
 
 Scripts live under `deployments/gcp/scripts`.
 
@@ -117,6 +129,7 @@ deployments/gcp/scripts/bootstrap-project.ps1 -BillingAccount <billing-account-i
 deployments/gcp/scripts/terraform-apply.ps1
 deployments/gcp/scripts/deploy.ps1
 deployments/gcp/scripts/smoke.ps1
+deployments/gcp/scripts/full-demo.ps1
 deployments/gcp/scripts/inspect-captures.ps1
 deployments/gcp/scripts/inspect-replay.ps1
 deployments/gcp/scripts/backup-storage.ps1
@@ -124,4 +137,4 @@ deployments/gcp/scripts/inspect-observability.ps1
 deployments/gcp/scripts/logs.ps1
 ```
 
-The guard script refuses to deploy unless the active account is `nickaccturk@gmail.com` and the active project is a dedicated `tracegate-*` project. Only TraceGate's public data-plane port `8080` is exposed by Terraform; production traffic on that port is HTTPS. Admin, PostgreSQL, telemetry services, and the replay target are inspected over SSH inside the VM.
+The guard script refuses to deploy unless the active account is `nickaccturk@gmail.com` and the active project is a dedicated `tracegate-*` project. Only TraceGate's public data-plane port `8080` is exposed by Terraform; production traffic on that port is HTTPS. Admin, Console, PostgreSQL, Grafana, telemetry services, and the replay target are inspected over SSH inside the VM.

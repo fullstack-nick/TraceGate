@@ -136,3 +136,19 @@ services:
       - /opt/tracegate/admin-token:/etc/prometheus/tracegate-admin-token:ro
     depends_on:
       - tracegate
+
+  grafana:
+    image: grafana/grafana-oss:11.6.0
+    container_name: tracegate-grafana
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboard-definitions/tracegate-overview.json
+    volumes:
+      - /opt/tracegate/grafana/provisioning:/etc/grafana/provisioning:ro
+    expose:
+      - "3000"
+    depends_on:
+      - prometheus

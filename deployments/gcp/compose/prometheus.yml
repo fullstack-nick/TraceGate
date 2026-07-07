@@ -4,6 +4,9 @@ global:
 scrape_configs:
   - job_name: tracegate
     metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials: tracegate-local-admin
     static_configs:
       - targets:
           - tracegate:9090

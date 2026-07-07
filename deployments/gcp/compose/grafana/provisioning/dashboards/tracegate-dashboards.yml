@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: TraceGate
+    orgId: 1
+    folder: TraceGate
+    type: file
+    disableDeletion: true
+    editable: false
+    options:
+      path: /etc/grafana/provisioning/dashboard-definitions

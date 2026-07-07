@@ -54,13 +54,14 @@ $remoteScriptPath = Join-Path $scratch "deploy-remote-$ImageTag.sh"
 
 docker save "tracegate:$ImageTag" -o $tarPath
 
-$prepareCommand = 'sudo mkdir -p /opt/tracegate/data/backups /opt/tracegate/postgres /opt/tracegate/tls && sudo chown -R "$USER:$USER" /opt/tracegate && sudo chown -R 10001:10001 /opt/tracegate/data || true'
+$prepareCommand = 'sudo mkdir -p /opt/tracegate/data/backups /opt/tracegate/postgres /opt/tracegate/tls /opt/tracegate/grafana && sudo chown -R "$USER:$USER" /opt/tracegate && sudo chown -R 10001:10001 /opt/tracegate/data || true'
 Invoke-Checked { gcloud compute ssh $VmName --zone $Zone --strict-host-key-checking=no --quiet --command $prepareCommand } "prepare VM directories"
 Invoke-Checked { gcloud compute scp $tarPath "${VmName}:/opt/tracegate/tracegate.tar" --zone $Zone --strict-host-key-checking=no --quiet } "upload image tar"
 Invoke-Checked { gcloud compute scp "$repo\deployments\gcp\compose\docker-compose.production.yml" "${VmName}:/opt/tracegate/docker-compose.yml" --zone $Zone --strict-host-key-checking=no --quiet } "upload production compose"
 Invoke-Checked { gcloud compute scp "$repo\deployments\gcp\compose\tracegate.production.toml" "${VmName}:/opt/tracegate/tracegate.toml" --zone $Zone --strict-host-key-checking=no --quiet } "upload production config"
 Invoke-Checked { gcloud compute scp "$repo\deployments\gcp\compose\otel-collector.yaml" "${VmName}:/opt/tracegate/otel-collector.yaml" --zone $Zone --strict-host-key-checking=no --quiet } "upload otel collector config"
 Invoke-Checked { gcloud compute scp "$repo\deployments\gcp\compose\prometheus.production.yml" "${VmName}:/opt/tracegate/prometheus.yml" --zone $Zone --strict-host-key-checking=no --quiet } "upload prometheus config"
+Invoke-Checked { gcloud compute scp --recurse "$repo\deployments\gcp\compose\grafana" "${VmName}:/opt/tracegate/" --zone $Zone --strict-host-key-checking=no --quiet } "upload grafana provisioning"
 Invoke-Checked { gcloud compute scp "$repo\deployments\gcp\systemd\tracegate.service" "${VmName}:/tmp/tracegate.service" --zone $Zone --strict-host-key-checking=no --quiet } "upload systemd unit"
 Invoke-Checked { gcloud compute scp $envPath "${VmName}:/opt/tracegate/current.env.next" --zone $Zone --strict-host-key-checking=no --quiet } "upload image env"
 
@@ -68,7 +69,7 @@ $remoteScript = @'
 #!/usr/bin/env bash
 set -euo pipefail
 cd /opt/tracegate
-sudo mkdir -p /opt/tracegate/data/backups /opt/tracegate/postgres /opt/tracegate/tls
+sudo mkdir -p /opt/tracegate/data/backups /opt/tracegate/postgres /opt/tracegate/tls /opt/tracegate/grafana
 sudo chown -R 10001:10001 /opt/tracegate/data || true
 if ! command -v openssl >/dev/null 2>&1; then
   sudo apt-get update

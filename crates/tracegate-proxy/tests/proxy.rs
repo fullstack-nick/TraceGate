@@ -24,7 +24,7 @@ use tracegate_core::{
 };
 use tracegate_observability::{Telemetry, trace_id_hex_from_traceparent};
 use tracegate_proxy::{serve_listener, serve_listeners};
-use tracegate_storage::{ListFilters, Storage};
+use tracegate_storage::{ListFilters, ReplayRunInsert, Storage};
 
 async fn start_backend(
     status: StatusCode,
@@ -240,6 +240,39 @@ async fn start_proxy_with_admin_token(
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let mut config = app_config(addr, admin_addr, vec![route]);
+    config.admin = AdminConfig {
+        token_env: Some("TRACEGATE_TEST_ADMIN_TOKEN".to_owned()),
+        token: Some(token.to_owned()),
+        allow_internal_network: false,
+    };
+    let telemetry = Telemetry::new(&config.observability);
+
+    tokio::spawn(async move {
+        serve_listeners(listener, admin_listener, config, telemetry, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    (addr, admin_addr, shutdown_tx)
+}
+
+async fn start_proxy_with_admin_storage_and_plugins(
+    route: Route,
+    storage: StorageConfig,
+    plugins: Vec<PluginConfig>,
+    token: &str,
+) -> (SocketAddr, SocketAddr, oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_addr = admin_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    let mut config = app_config(addr, admin_addr, vec![route]);
+    config.storage = storage;
+    config.plugins = plugins;
     config.admin = AdminConfig {
         token_env: Some("TRACEGATE_TEST_ADMIN_TOKEN".to_owned()),
         token: Some(token.to_owned()),
@@ -616,6 +649,164 @@ async fn admin_endpoints_require_bearer_token_when_configured() {
         .await
         .unwrap();
     assert_eq!(authorized.status(), StatusCode::OK);
+
+    let _ = proxy_shutdown.send(());
+    let _ = backend_shutdown.send(());
+}
+
+#[tokio::test]
+async fn admin_console_apis_surface_runtime_storage_and_plugin_state() {
+    let (backend_addr, hits, backend_shutdown) = start_policy_header_backend().await;
+    let storage = storage_config();
+    let storage_for_query = storage.clone();
+    let (proxy_addr, admin_addr, proxy_shutdown) = start_proxy_with_admin_storage_and_plugins(
+        route_to(backend_addr, "/api/payments", Duration::from_secs(1), 0),
+        storage,
+        vec![api_key_plugin()],
+        "admin-secret",
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let console = client
+        .get(format!("http://{admin_addr}/console/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(console.status(), StatusCode::OK);
+    assert!(console.text().await.unwrap().contains("TraceGate Console"));
+
+    let unauthorized = client
+        .get(format!("http://{admin_addr}/admin/api/overview"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let response = client
+        .get(format!("http://{proxy_addr}/api/payments/denied"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let _ = response.text().await.unwrap();
+
+    let storage = Storage::connect(&storage_for_query).await.unwrap();
+    storage.migrate().await.unwrap();
+    let details = wait_for_request(&storage, &request_id).await;
+    assert_eq!(details.plugin_decisions[0].action, "deny");
+    storage
+        .insert_replay_run(ReplayRunInsert {
+            replay_id: "rep-console".to_owned(),
+            original_request_id: request_id.clone(),
+            replay_request_id: "req-replay".to_owned(),
+            target: "http://replay-target:4000".to_owned(),
+            method: "GET".to_owned(),
+            path: "/api/payments/denied".to_owned(),
+            status: Some(200),
+            latency_ms: 7,
+            error: None,
+            diff_summary: Some("status changed 403 -> 200".to_owned()),
+            created_at_ms: tracegate_storage::now_ms(),
+        })
+        .await
+        .unwrap();
+
+    let overview: serde_json::Value = client
+        .get(format!("http://{admin_addr}/admin/api/overview"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(overview["route_count"], 1);
+    assert_eq!(overview["plugin_count"], 1);
+    assert_eq!(overview["storage_ready"], true);
+
+    let list: serde_json::Value = client
+        .get(format!("http://{admin_addr}/admin/api/requests?limit=250"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["limit"], 100);
+    assert_eq!(list["requests"][0]["request_id"], request_id);
+
+    let detail: serde_json::Value = client
+        .get(format!(
+            "http://{admin_addr}/admin/api/requests/{request_id}"
+        ))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        detail["details"]["plugin_decisions"][0]["plugin_id"],
+        "api-key-guard"
+    );
+    assert_eq!(detail["details"]["plugin_decisions"][0]["action"], "deny");
+    assert_eq!(
+        detail["details"]["replay_runs"][0]["replay_id"],
+        "rep-console"
+    );
+
+    let routes: serde_json::Value = client
+        .get(format!("http://{admin_addr}/admin/api/routes"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(routes["routes"][0]["id"], "test");
+    assert_eq!(routes["routes"][0]["upstreams"][0]["unhealthy"], false);
+
+    let plugins_response = client
+        .get(format!("http://{admin_addr}/admin/api/plugins"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap();
+    let plugins_text = plugins_response.text().await.unwrap();
+    assert!(plugins_text.contains("api-key-guard"));
+    assert!(plugins_text.contains("config_keys"));
+    assert!(plugins_text.contains("expected"));
+    assert!(!plugins_text.contains("tracegate-demo-key"));
+
+    let telemetry: serde_json::Value = client
+        .get(format!("http://{admin_addr}/admin/api/telemetry"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(telemetry["storage_ready"], true);
+    let series = telemetry["series"].as_array().unwrap();
+    assert!(series.iter().any(|series| {
+        series["name"] == "tracegate_requests_total" && series["present"] == true
+    }));
+    assert!(series.iter().any(|series| {
+        series["name"] == "tracegate_plugin_decisions_total" && series["present"] == true
+    }));
 
     let _ = proxy_shutdown.send(());
     let _ = backend_shutdown.send(());

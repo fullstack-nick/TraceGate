@@ -20,8 +20,8 @@ use bytes::Bytes;
 use http::{
     HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
     header::{
-        AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName,
-        PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
+        CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, PROXY_AUTHENTICATE,
+        PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
     },
 };
 use http_body::{Body, Frame};
@@ -39,14 +39,14 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc},
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch},
     time::timeout,
 };
 use tokio_rustls::TlsAcceptor;
 use tracegate_core::{
-    AdminConfig, AppConfig, CapturePolicy, FORWARDED_FOR_HEADER, FORWARDED_HOST_HEADER,
-    FORWARDED_PROTO_HEADER, RedactionConfig, Route, Router, StorageConfig, TlsConfig, Upstream,
-    request_id_from_headers, request_id_header_value,
+    AppConfig, CapturePolicy, FORWARDED_FOR_HEADER, FORWARDED_HOST_HEADER, FORWARDED_PROTO_HEADER,
+    RedactionConfig, Route, Router, StorageConfig, TlsConfig, Upstream, request_id_from_headers,
+    request_id_header_value,
 };
 use tracegate_observability::{PluginDecisionMetric, RequestMetric, Telemetry};
 use tracegate_storage::{
@@ -58,6 +58,8 @@ use tracegate_wasm::{
     status_from_deny,
 };
 use tracing::{Instrument, field};
+
+mod admin;
 
 type ProxyBody = BoxBody<Bytes, hyper::Error>;
 type ProxyConnector = HttpsConnector<HttpConnector>;
@@ -339,11 +341,24 @@ where
     };
     let tls_acceptor = tls_acceptor(&config.server_tls)?;
     spawn_retention_loop(storage, telemetry.clone());
+    let (admin_shutdown_tx, mut admin_shutdown_rx) = watch::channel(false);
+    let admin_task = tokio::spawn(admin::serve(admin_listener, admin_state, async move {
+        loop {
+            if *admin_shutdown_rx.borrow() {
+                break;
+            }
+            if admin_shutdown_rx.changed().await.is_err() {
+                break;
+            }
+        }
+    }));
     tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
             _ = &mut shutdown => {
+                let _ = admin_shutdown_tx.send(true);
+                let _ = admin_task.await;
                 break;
             }
             accepted = listener.accept() => {
@@ -352,24 +367,6 @@ where
                 let tls_acceptor = tls_acceptor.clone();
                 tokio::spawn(async move {
                     serve_proxy_stream(stream, remote_addr, proxy, tls_acceptor).await;
-                });
-            }
-            accepted = admin_listener.accept() => {
-                let (stream, _) = accepted?;
-                let admin_state = admin_state.clone();
-                tokio::spawn(async move {
-                    let service = service_fn(move |request| {
-                        let admin_state = admin_state.clone();
-                        async move { handle_admin_request(request, admin_state).await }
-                    });
-
-                    let io = TokioIo::new(stream);
-                    if let Err(err) = ServerBuilder::new(TokioExecutor::new())
-                        .serve_connection_with_upgrades(io, service)
-                        .await
-                    {
-                        tracing::warn!(error = %err, "admin connection failed");
-                    }
                 });
             }
         }
@@ -1788,111 +1785,6 @@ fn build_upstream_request(
     Ok(request)
 }
 
-async fn handle_admin_request(
-    request: Request<Incoming>,
-    admin_state: AdminState,
-) -> Result<Response<ProxyBody>, Infallible> {
-    let admin = {
-        let config = admin_state.current_config.read().await;
-        config.admin.clone()
-    };
-    if !admin_authorized(&request, &admin) {
-        return Ok(text_response(StatusCode::UNAUTHORIZED, "unauthorized\n"));
-    }
-
-    let response = match (request.method(), request.uri().path()) {
-        (&Method::GET, "/health/live") => text_response(StatusCode::OK, "live\n"),
-        (&Method::GET, "/health/ready") => match admin_state.storage.health_check().await {
-            Ok(()) => text_response(StatusCode::OK, "ready\n"),
-            Err(err) => text_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &format!("storage not ready: {err}\n"),
-            ),
-        },
-        (&Method::GET, "/metrics") if admin_state.telemetry.prometheus_enabled() => {
-            match admin_state.telemetry.render_prometheus() {
-                Ok(metrics) => response_with_content_type(
-                    StatusCode::OK,
-                    "application/openmetrics-text; version=1.0.0; charset=utf-8",
-                    metrics,
-                ),
-                Err(err) => text_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("failed to render metrics: {err}\n"),
-                ),
-            }
-        }
-        (&Method::GET, "/metrics") => text_response(StatusCode::NOT_FOUND, "metrics disabled\n"),
-        (&Method::POST, "/admin/reload") => reload_gateway(admin_state).await,
-        _ => text_response(StatusCode::NOT_FOUND, "not found\n"),
-    };
-
-    Ok(response)
-}
-
-fn admin_authorized(request: &Request<Incoming>, admin: &AdminConfig) -> bool {
-    let Some(token) = admin.token.as_deref() else {
-        return request.uri().path() != "/admin/reload";
-    };
-    let Some(header) = request.headers().get(AUTHORIZATION) else {
-        return false;
-    };
-    let Ok(value) = header.to_str() else {
-        return false;
-    };
-    value == format!("Bearer {token}")
-}
-
-async fn reload_gateway(admin_state: AdminState) -> Response<ProxyBody> {
-    let Some(path) = admin_state.config_path.clone() else {
-        return text_response(StatusCode::BAD_REQUEST, "reload config path unavailable\n");
-    };
-    let new_config = match tracegate_config::load_config(&path) {
-        Ok(config) => config,
-        Err(err) => {
-            return response_with_content_type(
-                StatusCode::BAD_REQUEST,
-                "application/json",
-                format!(
-                    r#"{{"status":"rejected","error":"{}"}}"#,
-                    json_escape(&err.to_string())
-                ),
-            );
-        }
-    };
-
-    let mut current = admin_state.current_config.write().await;
-    if let Err(err) = validate_reload_immutables(&current, &new_config) {
-        return response_with_content_type(
-            StatusCode::BAD_REQUEST,
-            "application/json",
-            format!(r#"{{"status":"rejected","error":"{}"}}"#, json_escape(&err)),
-        );
-    }
-    let new_state = match GatewayState::new(&new_config) {
-        Ok(state) => state,
-        Err(err) => {
-            return response_with_content_type(
-                StatusCode::BAD_REQUEST,
-                "application/json",
-                format!(
-                    r#"{{"status":"rejected","error":"{}"}}"#,
-                    json_escape(&err.to_string())
-                ),
-            );
-        }
-    };
-    let routes = new_config.routes.len();
-    let plugins = new_config.plugins.len();
-    admin_state.gateway_state.store(Arc::new(new_state));
-    *current = new_config;
-    response_with_content_type(
-        StatusCode::OK,
-        "application/json",
-        format!(r#"{{"status":"reloaded","routes":{routes},"plugins":{plugins}}}"#),
-    )
-}
-
 fn validate_reload_immutables(current: &AppConfig, next: &AppConfig) -> Result<(), String> {
     if current.mode != next.mode {
         return Err("server.mode cannot change during hot reload".to_owned());
@@ -1918,14 +1810,6 @@ fn validate_reload_immutables(current: &AppConfig, next: &AppConfig) -> Result<(
         return Err("storage settings cannot change during hot reload".to_owned());
     }
     Ok(())
-}
-
-fn json_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
 }
 
 fn record_span_fields(
@@ -1990,28 +1874,6 @@ fn full_body(body: &str) -> ProxyBody {
     Full::new(Bytes::from(body.to_owned()))
         .map_err(|never| match never {})
         .boxed()
-}
-
-fn text_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
-    response_with_content_type(status, "text/plain; charset=utf-8", body.to_owned())
-}
-
-fn response_with_content_type(
-    status: StatusCode,
-    content_type: &'static str,
-    body: String,
-) -> Response<ProxyBody> {
-    let mut response = Response::new(
-        Full::new(Bytes::from(body))
-            .map_err(|never| match never {})
-            .boxed(),
-    );
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static(content_type),
-    );
-    response
 }
 
 fn header_value(value: &str) -> Result<HeaderValue, AttemptError> {

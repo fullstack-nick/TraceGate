@@ -735,18 +735,16 @@ Done when:
 
 ### v0.7 TraceGate Console and Full Demo
 
-Deliver:
+Delivered scope:
 
-- Axum-served Console on admin port.
-- Recent requests view.
-- Request detail view.
-- Replay run view.
-- Route health view.
-- Plugin decisions view.
-- Telemetry status view.
-- Grafana dashboard provisioning.
-- Full Compose demo script.
-- Full GCP demo script using the live external endpoint and SSH verification.
+- Axum-served Console on the admin listener.
+- Bearer-protected admin JSON APIs for overview, requests, request detail, routes, plugins, and telemetry.
+- Recent requests, request detail, replay run, route health, plugin decisions, plugin summary, and telemetry status views.
+- No frontend build system; Console assets are embedded HTML/CSS/vanilla JS and contain no runtime data until a bearer token is entered.
+- Grafana `TraceGate Overview` dashboard provisioning for local, local-production, and GCP Compose.
+- Full local Compose demo script.
+- Full GCP demo script using the live external HTTPS endpoint plus SSH-only admin/console/Grafana verification.
+- GCP keeps public exposure limited to the HTTPS data-plane port; admin, Console APIs, Grafana, Prometheus, Jaeger, Postgres, and replay target remain internal.
 
 Done when:
 
@@ -755,7 +753,7 @@ Done when:
 - Console shows plugin deny decision.
 - Demo can be completed from a clean checkout with one Compose command and documented curls.
 - The same demo can be completed against the GCP VM from the pushed commit.
-- SSH inspection verifies console/admin logs and live telemetry service health.
+- SSH inspection verifies console/admin APIs, Grafana provisioning, logs, storage, and live telemetry service health.
 
 ### v1.0 Release Quality
 
