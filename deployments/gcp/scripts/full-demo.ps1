@@ -1,7 +1,8 @@
 param(
     [string] $ProjectId = "tracegate-r7m5o9ld",
     [string] $Zone = "us-central1-a",
-    [string] $VmName = "tracegate-vm"
+    [string] $VmName = "tracegate-vm",
+    [switch] $ReleaseQuality
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,7 +10,7 @@ $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repo = Resolve-Path (Join-Path $scriptRoot "..\..\..")
 $scratch = Join-Path $repo "deployments\gcp\.scratch"
 New-Item -ItemType Directory -Force -Path $scratch | Out-Null
-& "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Zone $Zone
+& "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Zone $Zone -ReleaseQuality:$ReleaseQuality
 
 $ip = (gcloud compute instances describe $VmName --zone $Zone --format="value(networkInterfaces[0].accessConfigs[0].natIP)").Trim()
 if ([string]::IsNullOrWhiteSpace($ip)) {

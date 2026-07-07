@@ -2,7 +2,8 @@ param(
     [string] $ProjectId = "tracegate-r7m5o9ld",
     [string] $Zone = "us-central1-a",
     [string] $VmName = "tracegate-vm",
-    [string] $OutputName = "tracegate-capture-backup.sql"
+    [string] $OutputName = "tracegate-capture-backup.sql",
+    [switch] $ReleaseQuality
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,7 +12,7 @@ $repo = Resolve-Path (Join-Path $scriptRoot "..\..\..")
 $scratch = Join-Path $repo "deployments\gcp\.scratch"
 New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 
-& "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Zone $Zone
+& "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Zone $Zone -ReleaseQuality:$ReleaseQuality
 
 if ($OutputName -notmatch '^[A-Za-z0-9._-]+$') {
     throw "output name contains unsupported characters"

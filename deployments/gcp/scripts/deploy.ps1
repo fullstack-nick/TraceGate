@@ -3,7 +3,8 @@ param(
     [string] $Zone = "us-central1-a",
     [string] $VmName = "tracegate-vm",
     [string] $ImageTag = "",
-    [switch] $AllowDirty
+    [switch] $AllowDirty,
+    [switch] $ReleaseQuality
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,7 +25,7 @@ function Invoke-Checked {
     }
 }
 
-& "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Zone $Zone
+& "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Zone $Zone -ReleaseQuality:$ReleaseQuality
 
 $explicitImageTag = -not [string]::IsNullOrWhiteSpace($ImageTag)
 $dirtyStatus = (@(git -C $repo status --porcelain) -join "`n").Trim()

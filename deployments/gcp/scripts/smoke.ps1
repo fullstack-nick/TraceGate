@@ -1,7 +1,8 @@
 param(
     [string] $ProjectId = "tracegate-r7m5o9ld",
     [string] $Zone = "us-central1-a",
-    [string] $VmName = "tracegate-vm"
+    [string] $VmName = "tracegate-vm",
+    [switch] $ReleaseQuality
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,7 +10,7 @@ $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repo = Resolve-Path (Join-Path $scriptRoot "..\..\..")
 $scratch = Join-Path $repo "deployments\gcp\.scratch"
 New-Item -ItemType Directory -Force -Path $scratch | Out-Null
-& "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Zone $Zone
+& "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Zone $Zone -ReleaseQuality:$ReleaseQuality
 
 $ip = (gcloud compute instances describe $VmName --zone $Zone --format="value(networkInterfaces[0].accessConfigs[0].natIP)").Trim()
 if ([string]::IsNullOrWhiteSpace($ip)) {
@@ -82,5 +83,5 @@ $encodedReplayCommand = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes
 $replayLauncher = "printf '%s' '$encodedReplayCommand' | base64 -d | bash"
 gcloud compute ssh $VmName --zone $Zone --strict-host-key-checking=no --quiet --command "$replayLauncher"
 gcloud compute ssh $VmName --zone $Zone --strict-host-key-checking=no --quiet --command "docker logs tracegate --tail 100"
-& "$scriptRoot\inspect-observability.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName
-& "$scriptRoot\inspect-captures.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName
+& "$scriptRoot\inspect-observability.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ReleaseQuality:$ReleaseQuality
+& "$scriptRoot\inspect-captures.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ReleaseQuality:$ReleaseQuality

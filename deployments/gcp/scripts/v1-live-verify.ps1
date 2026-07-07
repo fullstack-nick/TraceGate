@@ -310,17 +310,17 @@ docker exec -d tracegate-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_
     }
 }
 
-& "$scriptRoot\backup-storage.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -OutputName "tracegate-v1-release-quality-backup.sql"
+& "$scriptRoot\backup-storage.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -OutputName "tracegate-v1-release-quality-backup.sql" -ReleaseQuality
 
 if ($IncludeRollback) {
     if ([string]::IsNullOrWhiteSpace($CurrentImageTag)) {
         $CurrentImageTag = (git -C $repo rev-parse --short=12 HEAD).Trim()
     }
     Write-Host "Running rollback proof, then restoring tracegate:$CurrentImageTag"
-    & "$scriptRoot\rollback.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName
-    & "$scriptRoot\smoke.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName
-    & "$scriptRoot\deploy.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ImageTag $CurrentImageTag
-    & "$scriptRoot\smoke.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName
+    & "$scriptRoot\rollback.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ReleaseQuality
+    & "$scriptRoot\smoke.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ReleaseQuality
+    & "$scriptRoot\deploy.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ImageTag $CurrentImageTag -ReleaseQuality
+    & "$scriptRoot\smoke.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ReleaseQuality
 }
 
 Write-Host "TraceGate v1 live verification passed"

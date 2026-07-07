@@ -98,9 +98,9 @@ function Assert-SteadyState {
 switch ($Action) {
     "BaselineUp" {
         Invoke-TerraformApply -MachineType "n2-standard-16" -ReleaseQuality
-        & "$scriptRoot\status.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName
-        & "$scriptRoot\deploy.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName
-        & "$scriptRoot\full-demo.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName
+        & "$scriptRoot\status.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ReleaseQuality
+        & "$scriptRoot\deploy.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ReleaseQuality
+        & "$scriptRoot\full-demo.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ReleaseQuality
     }
     "LoadGenUp" {
         Invoke-TerraformApply -MachineType "n2-standard-16" -ReleaseQuality -LoadGeneratorEnabled

@@ -18,6 +18,10 @@ function Fail($Message) {
 
 $account = (gcloud config get-value account 2>$null).Trim()
 $activeProject = (gcloud config get-value project 2>$null).Trim()
+$zoneRegion = $Zone -replace '-[a-z]$', ''
+if (-not $PSBoundParameters.ContainsKey("Region")) {
+    $Region = $zoneRegion
+}
 
 if ($account -ne "nickaccturk@gmail.com") {
     Fail "active gcloud account must be nickaccturk@gmail.com, got '$account'"
@@ -39,8 +43,16 @@ if ($Region -notin @("us-central1", "us-east1", "us-west1")) {
     Fail "region '$Region' is not in the Compute Engine free-tier region set"
 }
 
-if ($Zone -ne "us-central1-a") {
-    Fail "v0.1 is locked to us-central1-a, got '$Zone'"
+if ($zoneRegion -ne $Region) {
+    Fail "zone '$Zone' is not in region '$Region'"
+}
+
+if ($ReleaseQuality) {
+    if ($Zone -notin @("us-central1-a", "us-west1-a")) {
+        Fail "release-quality zone must be us-central1-a or proven-capacity fallback us-west1-a, got '$Zone'"
+    }
+} elseif ($Zone -ne "us-central1-a") {
+    Fail "steady-state operations are locked to us-central1-a, got '$Zone'"
 }
 
 if ($ReleaseQuality) {

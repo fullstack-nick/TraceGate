@@ -1,12 +1,13 @@
 param(
     [string] $ProjectId = "tracegate-r7m5o9ld",
     [string] $Zone = "us-central1-a",
-    [string] $VmName = "tracegate-vm"
+    [string] $VmName = "tracegate-vm",
+    [switch] $ReleaseQuality
 )
 
 $ErrorActionPreference = "Stop"
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-& "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Zone $Zone
+& "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Zone $Zone -ReleaseQuality:$ReleaseQuality
 
 $remoteCommand = @'
 set -euo pipefail
