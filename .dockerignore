@@ -6,5 +6,8 @@ target
 **/*.tfplan
 deployments/gcp/.scratch
 proof/tmp
+data
+.env
+.env.*
 *.tar
 *.tar.gz
