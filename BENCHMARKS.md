@@ -8,6 +8,7 @@ TraceGate v1 uses two performance gates:
 ## Criterion
 
 ```powershell
+scripts/cargo.ps1 build --manifest-path examples/plugins/api-key-guard/Cargo.toml --target wasm32-wasip2 --release
 scripts/cargo.ps1 bench -p tracegate-proxy --bench release_overhead -- --sample-size 10 --measurement-time 1 --warm-up-time 1
 ```
 

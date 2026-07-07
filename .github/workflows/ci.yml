@@ -62,4 +62,5 @@ jobs:
           name: lcov
           path: lcov.info
       - name: Benchmark smoke
+        timeout-minutes: 15
         run: cargo bench -p tracegate-proxy --bench release_overhead -- --sample-size 10 --measurement-time 1 --warm-up-time 1

@@ -2,8 +2,6 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
-    process::Command,
-    sync::OnceLock,
     time::Duration,
 };
 
@@ -138,11 +136,7 @@ fn route_to(addr: SocketAddr, capture: CaptureConfig) -> Route {
 fn api_key_plugin() -> PluginConfig {
     PluginConfig {
         id: "api-key-guard".to_owned(),
-        path: example_plugin_path(
-            "api-key-guard",
-            "tracegate_api_key_guard.wasm",
-            &API_KEY_PLUGIN,
-        ),
+        path: example_plugin_path("api-key-guard", "tracegate_api_key_guard.wasm"),
         hook: PluginHook::BeforeRequest,
         routes: vec!["bench".to_owned()],
         timeout: Duration::from_millis(100),
@@ -163,47 +157,26 @@ fn api_key_plugin() -> PluginConfig {
     }
 }
 
-static API_KEY_PLUGIN: OnceLock<PathBuf> = OnceLock::new();
-
-fn example_plugin_path(
-    plugin_dir: &str,
-    wasm_name: &str,
-    cache: &'static OnceLock<PathBuf>,
-) -> PathBuf {
-    cache
-        .get_or_init(|| {
-            let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .canonicalize()
-                .unwrap();
-            let manifest = repo
-                .join("examples")
-                .join("plugins")
-                .join(plugin_dir)
-                .join("Cargo.toml");
-            let status = Command::new("cargo")
-                .args([
-                    "build",
-                    "--manifest-path",
-                    manifest.to_str().unwrap(),
-                    "--target",
-                    "wasm32-wasip2",
-                    "--release",
-                ])
-                .current_dir(&repo)
-                .status()
-                .unwrap();
-            assert!(status.success(), "failed to build {plugin_dir}");
-            repo.join("examples")
-                .join("plugins")
-                .join(plugin_dir)
-                .join("target")
-                .join("wasm32-wasip2")
-                .join("release")
-                .join(wasm_name)
-        })
-        .clone()
+fn example_plugin_path(plugin_dir: &str, wasm_name: &str) -> PathBuf {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .unwrap();
+    let path = repo
+        .join("examples")
+        .join("plugins")
+        .join(plugin_dir)
+        .join("target")
+        .join("wasm32-wasip2")
+        .join("release")
+        .join(wasm_name);
+    assert!(
+        path.exists(),
+        "missing benchmark plugin artifact at {}; build example plugins before running the benchmark",
+        path.display()
+    );
+    path
 }
 
 fn http_request(addr: SocketAddr, extra_headers: &[(&str, &str)]) {
