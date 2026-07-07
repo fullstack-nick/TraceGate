@@ -33,26 +33,27 @@ function Invoke-TerraformApply {
         [switch] $LoadGeneratorEnabled
     )
 
-    $args = @(
+    $tfArgs = @(
         "-ProjectId", $ProjectId,
         "-Region", $Region,
         "-Zone", $Zone,
-        "-MachineType", $MachineType
+        "-MachineType", $MachineType,
+        "-DiskSizeGb", 30
     )
     if (-not [string]::IsNullOrWhiteSpace($OperatorCidr)) {
-        $args += @("-OperatorCidr", $OperatorCidr)
+        $tfArgs += @("-OperatorCidr", $OperatorCidr)
     }
     if ($ReleaseQuality) {
-        $args += "-ReleaseQuality"
+        $tfArgs += "-ReleaseQuality"
     }
     if ($LoadGeneratorEnabled) {
-        $args += "-LoadGeneratorEnabled"
+        $tfArgs += "-LoadGeneratorEnabled"
     }
     if ($AutoApprove) {
-        $args += "-AutoApprove"
+        $tfArgs += "-AutoApprove"
     }
 
-    & "$scriptRoot\terraform-apply.ps1" @args
+    & "$scriptRoot\terraform-apply.ps1" @tfArgs
 }
 
 function Get-TraceGateInstances {
