@@ -65,8 +65,10 @@ resource "google_compute_instance" "tracegate" {
     systemctl enable --now docker
     mkdir -p /opt/tracegate
 
-    if command -v docker-compose >/dev/null 2>&1; then
-      ln -sf "$(command -v docker-compose)" /usr/local/bin/docker-compose
+    if [ -x /usr/bin/docker-compose ]; then
+      ln -sfn /usr/bin/docker-compose /usr/local/bin/docker-compose
+    elif command -v docker-compose >/dev/null 2>&1 && [ "$(command -v docker-compose)" != "/usr/local/bin/docker-compose" ]; then
+      ln -sfn "$(command -v docker-compose)" /usr/local/bin/docker-compose
     else
       cat >/usr/local/bin/docker-compose <<'EOF'
 #!/usr/bin/env bash

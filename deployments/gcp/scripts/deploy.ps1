@@ -74,6 +74,16 @@ if ! command -v openssl >/dev/null 2>&1; then
   sudo apt-get update
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssl
 fi
+if [ -x /usr/bin/docker-compose ]; then
+  sudo ln -sfn /usr/bin/docker-compose /usr/local/bin/docker-compose
+elif ! command -v docker-compose >/dev/null 2>&1; then
+  cat >/tmp/docker-compose <<'EOF'
+#!/usr/bin/env bash
+exec docker compose "$@"
+EOF
+  sudo mv /tmp/docker-compose /usr/local/bin/docker-compose
+  sudo chmod +x /usr/local/bin/docker-compose
+fi
 if [ ! -f /opt/tracegate/secrets.env ]; then
   POSTGRES_PASSWORD="$(openssl rand -hex 24)"
   ADMIN_TOKEN="$(openssl rand -hex 32)"

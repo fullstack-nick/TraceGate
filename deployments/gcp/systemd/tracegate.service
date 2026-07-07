@@ -1,5 +1,5 @@
 [Unit]
-Description=TraceGate v0.1 Docker Compose runtime
+Description=TraceGate Docker Compose runtime
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
@@ -8,8 +8,8 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/tracegate
 EnvironmentFile=/opt/tracegate/current.env
-ExecStart=/usr/local/bin/docker-compose --env-file /opt/tracegate/current.env -f /opt/tracegate/docker-compose.yml up --remove-orphans
-ExecStop=/usr/local/bin/docker-compose --env-file /opt/tracegate/current.env -f /opt/tracegate/docker-compose.yml down
+ExecStart=/usr/bin/docker-compose --env-file /opt/tracegate/current.env -f /opt/tracegate/docker-compose.yml up --remove-orphans
+ExecStop=/usr/bin/docker-compose --env-file /opt/tracegate/current.env -f /opt/tracegate/docker-compose.yml down
 Restart=always
 RestartSec=5
 TimeoutStartSec=0
