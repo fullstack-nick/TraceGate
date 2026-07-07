@@ -71,6 +71,22 @@ Expected behavior:
 - Mutating replay methods require `--confirm-side-effects`.
 - Jaeger is available locally at `http://localhost:16686`; Prometheus is available locally at `http://localhost:9091`.
 
+## Local Production Mode
+
+Local production mode uses PostgreSQL, rustls on the data-plane listener, HTTPS demo upstreams, bearer-authenticated admin routes, and the same production config validation rules used on GCP.
+
+```powershell
+scripts\prepare-production-compose.ps1
+docker compose -f docker-compose.production.yml up --build
+curl.exe --cacert data\production\tls\ca.crt https://localhost:8443/api/users/123
+curl.exe -i http://localhost:19090/health/live
+curl.exe -i -H "Authorization: Bearer <TRACEGATE_ADMIN_TOKEN>" http://localhost:19090/health/ready
+curl.exe -X POST -H "Authorization: Bearer <TRACEGATE_ADMIN_TOKEN>" http://localhost:19090/admin/reload
+docker compose -f docker-compose.production.yml exec tracegate tracegate requests list --config /etc/tracegate/tracegate.toml --failed
+```
+
+`scripts\prepare-production-compose.ps1` writes ignored local secrets to `.env.production`, writes the Prometheus admin-token file, and generates a private CA plus TraceGate/upstream certificates under `data\production\tls`.
+
 ## Local Checks
 
 ```powershell

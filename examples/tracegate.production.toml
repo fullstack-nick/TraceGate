@@ -1,0 +1,113 @@
+[server]
+mode = "production"
+listen = "0.0.0.0:8080"
+admin_listen = "0.0.0.0:9090"
+
+[server.tls]
+enabled = true
+cert_path = "/etc/tracegate/tls/tracegate.crt"
+key_path = "/etc/tracegate/tls/tracegate.key"
+
+[admin]
+token_env = "TRACEGATE_ADMIN_TOKEN"
+allow_internal_network = true
+
+[upstream_tls]
+ca_cert_path = "/etc/tracegate/tls/ca.crt"
+
+[logging]
+json = true
+
+[storage]
+driver = "postgres"
+url_env = "TRACEGATE_DATABASE_URL"
+retention_days = 7
+max_total_capture_bytes = 1073741824
+max_capture_bytes_per_request = 1048576
+capture_queue_capacity = 1024
+
+[redaction]
+headers = ["authorization", "cookie", "set-cookie", "x-api-key"]
+query_params = ["token", "access_token", "api_key"]
+
+[observability]
+service_name = "tracegate"
+environment = "local-production"
+otlp_endpoint = "http://otel-collector:4317"
+prometheus_enabled = true
+json_logs = true
+
+[[routes]]
+id = "users"
+hosts = ["*"]
+path_prefix = "/api/users"
+upstreams = ["https://users-service:3443"]
+timeout_ms = 3000
+retries = 1
+concurrency_limit = 100
+passive_health_failures = 3
+passive_health_cooldown_ms = 10000
+capture_policy = "off"
+
+[[routes]]
+id = "payments"
+hosts = ["*"]
+path_prefix = "/api/payments"
+upstreams = ["https://payments-service:4443", "https://payments-service-alt:4444"]
+timeout_ms = 3000
+retries = 0
+concurrency_limit = 100
+passive_health_failures = 3
+passive_health_cooldown_ms = 10000
+capture_policy = "errors_and_slow"
+slow_threshold_ms = 500
+capture_request_body = true
+capture_response_body_bytes = 4096
+
+[[routes]]
+id = "plugin-timeout"
+hosts = ["*"]
+path_prefix = "/api/plugin-timeout"
+upstreams = ["https://payments-service:4443"]
+timeout_ms = 3000
+retries = 0
+concurrency_limit = 100
+passive_health_failures = 3
+passive_health_cooldown_ms = 10000
+capture_policy = "off"
+
+[[plugins]]
+id = "api-key-guard"
+path = "/usr/local/share/tracegate/plugins/api-key-guard.wasm"
+hook = "before_request"
+routes = ["payments"]
+timeout_ms = 50
+memory_limit_bytes = 16777216
+fuel = 10000000
+body_preview_bytes = 0
+raw_headers = ["x-api-key"]
+config = { header = "x-api-key", expected = "tracegate-demo-key", message = "missing or invalid API key" }
+
+[[plugins]]
+id = "header-normalizer"
+path = "/usr/local/share/tracegate/plugins/header-normalizer.wasm"
+hook = "before_request"
+routes = ["payments"]
+timeout_ms = 50
+memory_limit_bytes = 16777216
+fuel = 10000000
+body_preview_bytes = 1024
+raw_headers = []
+config = { set_header = "x-tracegate-policy", set_value = "normalized", remove_header = "x-remove-me" }
+
+[[plugins]]
+id = "timeout-normalizer"
+path = "/usr/local/share/tracegate/plugins/header-normalizer.wasm"
+hook = "before_request"
+routes = ["plugin-timeout"]
+timeout_ms = 1
+memory_limit_bytes = 16777216
+fuel = 1000000000
+body_preview_bytes = 0
+raw_headers = []
+config = { spin_iterations = "100000000" }

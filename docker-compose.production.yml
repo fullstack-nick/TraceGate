@@ -1,0 +1,121 @@
+services:
+  tracegate:
+    build:
+      context: .
+      args:
+        TRACEGATE_GIT_SHA: ${TRACEGATE_GIT_SHA:-local-production}
+    image: tracegate:${TRACEGATE_IMAGE_TAG:-local-production}
+    command: ["tracegate", "serve", "--config", "/etc/tracegate/tracegate.toml"]
+    env_file:
+      - .env.production
+    ports:
+      - "8443:8080"
+      - "127.0.0.1:19090:9090"
+    volumes:
+      - ./examples/tracegate.production.toml:/etc/tracegate/tracegate.toml:ro
+      - ./data/production/tls:/etc/tracegate/tls:ro
+    depends_on:
+      - postgres
+      - otel-collector
+      - users-service
+      - payments-service
+      - payments-service-alt
+      - replay-target
+
+  postgres:
+    image: postgres:16-alpine
+    env_file:
+      - .env.production
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=32MB"
+      - "-c"
+      - "max_connections=20"
+    volumes:
+      - ./data/production/postgres:/var/lib/postgresql/data
+    expose:
+      - "5432"
+
+  users-service:
+    image: tracegate:${TRACEGATE_IMAGE_TAG:-local-production}
+    command:
+      - "tracegate-demo-backend"
+      - "--service"
+      - "users"
+      - "--listen"
+      - "0.0.0.0:3443"
+      - "--tls-cert"
+      - "/etc/tracegate/tls/upstreams.crt"
+      - "--tls-key"
+      - "/etc/tracegate/tls/upstreams.key"
+    volumes:
+      - ./data/production/tls:/etc/tracegate/tls:ro
+    expose:
+      - "3443"
+
+  payments-service:
+    image: tracegate:${TRACEGATE_IMAGE_TAG:-local-production}
+    command:
+      - "tracegate-demo-backend"
+      - "--service"
+      - "payments"
+      - "--listen"
+      - "0.0.0.0:4443"
+      - "--tls-cert"
+      - "/etc/tracegate/tls/upstreams.crt"
+      - "--tls-key"
+      - "/etc/tracegate/tls/upstreams.key"
+    volumes:
+      - ./data/production/tls:/etc/tracegate/tls:ro
+    expose:
+      - "4443"
+
+  payments-service-alt:
+    image: tracegate:${TRACEGATE_IMAGE_TAG:-local-production}
+    command:
+      - "tracegate-demo-backend"
+      - "--service"
+      - "payments"
+      - "--listen"
+      - "0.0.0.0:4444"
+      - "--tls-cert"
+      - "/etc/tracegate/tls/upstreams.crt"
+      - "--tls-key"
+      - "/etc/tracegate/tls/upstreams.key"
+    volumes:
+      - ./data/production/tls:/etc/tracegate/tls:ro
+    expose:
+      - "4444"
+
+  replay-target:
+    image: tracegate:${TRACEGATE_IMAGE_TAG:-local-production}
+    command: ["tracegate-demo-backend", "--service", "replay", "--listen", "0.0.0.0:4000"]
+    ports:
+      - "14000:4000"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.155.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./deployments/gcp/compose/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.19.0
+    ports:
+      - "16687:16686"
+
+  prometheus:
+    image: prom/prometheus:v3.13.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=2h"
+    ports:
+      - "19091:9090"
+    volumes:
+      - ./deployments/gcp/compose/prometheus.production.yml:/etc/prometheus/prometheus.yml:ro
+      - ./data/production/admin-token:/etc/prometheus/tracegate-admin-token:ro
+    depends_on:
+      - tracegate
