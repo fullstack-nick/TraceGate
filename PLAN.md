@@ -59,10 +59,14 @@ Locked GCP decisions:
 
 - GCP is the production proof environment for every stage.
 - The project is built under GCP free-trial/free-tier constraints.
+- v1.0 release-quality development and verification may temporarily exceed the steady-state free-tier VM shape so tests measure TraceGate instead of `e2-micro` resource starvation.
 - Every stage starts with a current free-tier budget and quota check before resources are created or changed.
 - Terraform is the source of truth for GCP infrastructure.
 - Direct SSH is part of the official workflow for deployment control, runtime inspection, log review, storage inspection, and debugging.
 - The v1 runtime target is a Terraform-managed Compute Engine VM running Docker Compose services under systemd.
+- The v1 release-quality app VM target is `n2-standard-16` for development, full live verification, reboot/restart proof, and stress testing.
+- The v1 release-quality load generator target is a separate `n2-standard-8` VM created only for stress testing and deleted after the stress gate.
+- After v1.0 is fully developed, verified, and documented, the app VM must be resized back to `e2-micro`, and the load generator VM must be deleted so the only remaining TraceGate VM is the steady-state `e2-micro` instance.
 - Managed GKE, Cloud SQL, Memorystore, external load balancers, and Cloud Run are excluded from v1 because the free-tier/free-trial budget and direct-control workflow take priority.
 - GitHub is the source of truth for deployable code. A stage is not complete until the relevant commit is pushed.
 - No local-only deliverables count. Anything built locally must be deployable and testable on the live GCP VM.
@@ -759,6 +763,12 @@ Done when:
 
 Deliver:
 
+- Terraform/script support to resize the current app VM from `e2-micro` to `n2-standard-16` for v1 development and full verification, then resize it back to `e2-micro` after v1 completion.
+- Terraform/script support to create a separate `n2-standard-8` load generator VM for stress testing and delete it after the v1 stress gate.
+- A v1 baseline gate that redeploys the existing v0.7 artifact or current `main`, then reruns the v0.7 full-demo on the larger app VM before new v1 hardening work proceeds.
+- Reboot, restart, and sustained-load proof on the larger app VM.
+- Full live verification scripts for every feature built in TraceGate: routing, TLS, upstream TLS, request IDs, logs, metrics, traces, storage, redaction, capture, retention, replay, plugin allow/deny/mutation/timeout, hot reload, passive health, backpressure, Console APIs, Console UI, Grafana dashboards, backup, rollback, and GCP deployment scripts.
+- Heavy stress tests for every feature path built in TraceGate, run from the separate load generator VM so load generation does not steal CPU or memory from the app VM.
 - GitHub Actions CI for fmt, clippy, tests, coverage artifact, and benchmark smoke.
 - Criterion benchmarks for proxy overhead, capture overhead, replay throughput, and plugin overhead.
 - Load test script using generated HTTP traffic.
@@ -771,11 +781,16 @@ Deliver:
 
 Done when:
 
+- The current GCP app VM has been upgraded to `n2-standard-16`, the pushed v0.7/current-main baseline has been redeployed, and the v0.7 full-demo passes as the starting v1 proof.
 - CI passes on clean checkout.
 - Benchmarks compare direct upstream, proxy only, proxy with capture, and proxy with plugin.
-- Fresh Terraform-managed GCP deployment routes traffic and exposes metrics.
+- Fresh Terraform-managed GCP deployment routes traffic and exposes metrics on the `n2-standard-16` app VM.
+- Full live verification has exercised every shipped feature through the external HTTPS endpoint plus SSH/internal readback, with proof recorded in `proof/v1.0-release-quality.md`.
+- Heavy stress testing has exercised routing, capture, replay, plugin, storage, telemetry, Console API, Grafana, reload, backpressure, and rollback paths from the separate `n2-standard-8` load generator VM.
+- Reboot/restart/load proof shows the full stack comes back cleanly on the larger app VM and keeps passing live smoke and internal readiness checks after restart.
 - Rollback script restores the previous known-good VM deployment.
 - Documentation walks a new user from demo to replay to plugin policy.
+- After all v1 development and verification is complete, the load generator VM is deleted, the app VM is resized back to `e2-micro`, and a final GCP inventory/billing hygiene proof shows no `n2-standard-16` or `n2-standard-8` TraceGate VMs remain.
 - v1.0 tag can be cut from the repository with repeatable commands.
 
 ## Testing Strategy
