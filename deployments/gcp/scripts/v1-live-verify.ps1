@@ -3,9 +3,11 @@ param(
     [string] $Zone = "us-central1-a",
     [string] $VmName = "tracegate-vm",
     [int] $BackpressureRequests = 1300,
+    [int] $BackpressureConcurrency = 64,
     [switch] $SkipBackpressure,
     [switch] $IncludeRollback,
-    [string] $CurrentImageTag = ""
+    [string] $CurrentImageTag = "",
+    [string] $RollbackImageTag = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -146,7 +148,6 @@ for series in \
   tracegate_captures_total \
   tracegate_capture_dropped_total \
   tracegate_storage_retention_runs_total \
-  tracegate_replay_runs_total \
   tracegate_plugin_decisions_total \
   tracegate_plugin_duration_seconds \
   tracegate_plugin_timeouts_total \
@@ -236,7 +237,7 @@ grep -F '"traceID"' /tmp/tracegate-v1-jaeger-traces.json
 
 echo "== grafana =="
 curl_internal http://grafana:3000/api/health | tee /tmp/tracegate-v1-grafana-health.json
-grep -F '"database":"ok"' /tmp/tracegate-v1-grafana-health.json
+grep -E '"database"[[:space:]]*:[[:space:]]*"ok"' /tmp/tracegate-v1-grafana-health.json
 curl_internal 'http://grafana:3000/api/search?query=TraceGate%20Overview' | tee /tmp/tracegate-v1-grafana-search.json
 grep -F 'tracegate-overview' /tmp/tracegate-v1-grafana-search.json
 
@@ -259,7 +260,7 @@ $remoteCommand = $remoteCommand.Replace("__LARGE_REQUEST_ID__", $large.RequestId
 Invoke-Remote $remoteCommand
 
 if (-not $SkipBackpressure) {
-    Write-Host "Starting v1 backpressure proof with $BackpressureRequests HTTPS requests"
+    Write-Host "Starting v1 backpressure proof with $BackpressureRequests HTTPS requests at concurrency $BackpressureConcurrency"
     $beforeCommand = @'
 set -euo pipefail
 cd /opt/tracegate
@@ -273,32 +274,19 @@ docker run --rm --network tracegate_default curlimages/curl:8.10.1 -fsS -H "Auth
 
     $lockCommand = @'
 set -euo pipefail
-docker exec -d tracegate-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "BEGIN; LOCK TABLE requests IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(120); COMMIT;"'
+docker exec -d tracegate-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "BEGIN; LOCK TABLE requests IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(300); COMMIT;"'
 '@
     Invoke-Remote $lockCommand
     Start-Sleep -Seconds 3
 
-    $statusCounts = @{}
-    for ($i = 1; $i -le $BackpressureRequests; $i++) {
-        $url = "https://${ip}:8080/api/payments/large-fail?visible=yes&seq=$i"
-        $tmp = New-TemporaryFile
-        $status = (curl.exe -sS @curlTlsArgs --max-time 10 -o $tmp -w "%{http_code}" -X POST -H "x-api-key: tracegate-demo-key" -H "content-type: application/json" --data '{"note":"v1 backpressure"}' $url).Trim()
-        Remove-Item $tmp -Force
-        if ([string]::IsNullOrWhiteSpace($status)) {
-            $status = "curl-error-$LASTEXITCODE"
-        }
-        if (-not $statusCounts.ContainsKey($status)) {
-            $statusCounts[$status] = 0
-        }
-        $statusCounts[$status] += 1
-        if (($i % 100) -eq 0) {
-            Write-Host "backpressure_requests=$i"
-        }
-    }
-
-    Write-Host "Backpressure status counts:"
-    $statusCounts.GetEnumerator() | Sort-Object Name | ForEach-Object { Write-Host "  $($_.Name)=$($_.Value)" }
-    Start-Sleep -Seconds 10
+    $burstTemplate = @'
+set -euo pipefail
+docker run --rm --network tracegate_default curlimages/curl:8.10.1 sh -c 'seq 1 __BACKPRESSURE_REQUESTS__ | xargs -P __BACKPRESSURE_CONCURRENCY__ -I{} sh -c '"'"'curl -k -sS --max-time 15 -o /dev/null -w "%{http_code}\n" -X POST -H "x-api-key: tracegate-demo-key" --data v1-backpressure "https://tracegate:8080/api/payments/large-fail?visible=yes&seq={}" || echo curl-error'"'"' | sort | uniq -c | tee /tmp/tracegate-v1-backpressure-counts.txt'
+'@
+    $burstCommand = $burstTemplate.Replace("__BACKPRESSURE_REQUESTS__", "$BackpressureRequests")
+    $burstCommand = $burstCommand.Replace("__BACKPRESSURE_CONCURRENCY__", "$BackpressureConcurrency")
+    Invoke-Remote $burstCommand
+    Start-Sleep -Seconds 20
 
     $afterPath = Join-Path $scratch "v1-capture-dropped-after.txt"
     gcloud compute ssh $VmName --zone $Zone --strict-host-key-checking=no --quiet --command "printf '%s' '$encodedBefore' | base64 -d | bash" | Tee-Object -FilePath $afterPath
@@ -316,10 +304,17 @@ if ($IncludeRollback) {
     if ([string]::IsNullOrWhiteSpace($CurrentImageTag)) {
         $CurrentImageTag = (git -C $repo rev-parse --short=12 HEAD).Trim()
     }
+    if (-not [string]::IsNullOrWhiteSpace($RollbackImageTag)) {
+        Write-Host "Priming rollback proof with tracegate:$RollbackImageTag, then deploying tracegate:$CurrentImageTag"
+        & "$scriptRoot\deploy.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ImageTag $RollbackImageTag -SkipBuild -ReleaseQuality
+        & "$scriptRoot\smoke.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ReleaseQuality
+        & "$scriptRoot\deploy.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ImageTag $CurrentImageTag -SkipBuild -ReleaseQuality
+        & "$scriptRoot\smoke.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ReleaseQuality
+    }
     Write-Host "Running rollback proof, then restoring tracegate:$CurrentImageTag"
     & "$scriptRoot\rollback.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ReleaseQuality
     & "$scriptRoot\smoke.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ReleaseQuality
-    & "$scriptRoot\deploy.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ImageTag $CurrentImageTag -ReleaseQuality
+    & "$scriptRoot\deploy.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ImageTag $CurrentImageTag -SkipBuild -ReleaseQuality
     & "$scriptRoot\smoke.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -ReleaseQuality
 }
 

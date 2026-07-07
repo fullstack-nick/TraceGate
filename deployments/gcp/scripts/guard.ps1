@@ -6,6 +6,7 @@ param(
     [string] $MachineType = "e2-micro",
     [int] $DiskSizeGb = 30,
     [switch] $ReleaseQuality,
+    [switch] $AllowFallbackZone,
     [switch] $LoadGeneratorEnabled,
     [string] $LoadGeneratorMachineType = "n2-standard-8"
 )
@@ -47,12 +48,21 @@ if ($zoneRegion -ne $Region) {
     Fail "zone '$Zone' is not in region '$Region'"
 }
 
-if ($ReleaseQuality) {
+if ($ReleaseQuality -or $AllowFallbackZone) {
     if ($Zone -notin @("us-central1-a", "us-west1-a")) {
-        Fail "release-quality zone must be us-central1-a or proven-capacity fallback us-west1-a, got '$Zone'"
+        Fail "zone must be us-central1-a or proven-capacity fallback us-west1-a, got '$Zone'"
     }
 } elseif ($Zone -ne "us-central1-a") {
     Fail "steady-state operations are locked to us-central1-a, got '$Zone'"
+}
+
+if ($AllowFallbackZone -and -not $ReleaseQuality) {
+    if ($MachineType -ne "e2-micro") {
+        Fail "fallback-zone cleanup without -ReleaseQuality is only allowed for e2-micro, got '$MachineType'"
+    }
+    if ($LoadGeneratorEnabled) {
+        Fail "fallback-zone cleanup cannot create a load generator"
+    }
 }
 
 if ($ReleaseQuality) {
@@ -85,4 +95,5 @@ Write-Host "  region:  $Region"
 Write-Host "  zone:    $Zone"
 Write-Host "  vm:      $MachineType / ${DiskSizeGb}GB pd-standard"
 Write-Host "  release-quality: $([bool] $ReleaseQuality)"
+Write-Host "  allow-fallback:  $([bool] $AllowFallbackZone)"
 Write-Host "  load-generator:  $([bool] $LoadGeneratorEnabled) $LoadGeneratorMachineType"

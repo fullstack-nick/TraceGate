@@ -6,6 +6,7 @@ param(
     [int] $DiskSizeGb = 30,
     [string] $OperatorCidr = "",
     [switch] $ReleaseQuality,
+    [switch] $AllowFallbackZone,
     [switch] $LoadGeneratorEnabled,
     [string] $LoadGeneratorMachineType = "n2-standard-8",
     [switch] $AutoApprove
@@ -27,6 +28,7 @@ if ([string]::IsNullOrWhiteSpace($OperatorCidr)) {
     -MachineType $MachineType `
     -DiskSizeGb $DiskSizeGb `
     -ReleaseQuality:$ReleaseQuality `
+    -AllowFallbackZone:$AllowFallbackZone `
     -LoadGeneratorEnabled:$LoadGeneratorEnabled `
     -LoadGeneratorMachineType $LoadGeneratorMachineType
 

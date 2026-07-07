@@ -133,7 +133,7 @@ grep -F '"name":"tracegate_plugin_decisions_total","present":true' /tmp/tracegat
 grep -F '"name":"tracegate_plugin_duration_seconds","present":true' /tmp/tracegate-telemetry.json
 
 curl_internal http://grafana:3000/api/health | tee /tmp/tracegate-grafana-health.json
-grep -F '"database":"ok"' /tmp/tracegate-grafana-health.json
+grep -E '"database"[[:space:]]*:[[:space:]]*"ok"' /tmp/tracegate-grafana-health.json
 curl_internal 'http://grafana:3000/api/search?query=TraceGate%20Overview' | tee /tmp/tracegate-grafana-search.json
 grep -F 'tracegate-overview' /tmp/tracegate-grafana-search.json
 
@@ -148,6 +148,9 @@ $remoteCommand = $remoteCommand.Replace("__DENIED_REQUEST_ID__", $denied.Request
 $encodedRemoteCommand = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($remoteCommand))
 $remoteLauncher = "printf '%s' '$encodedRemoteCommand' | base64 -d | bash"
 gcloud compute ssh $VmName --zone $Zone --strict-host-key-checking=no --quiet --command $remoteLauncher
+if ($LASTEXITCODE -ne 0) {
+    throw "remote full-demo readback failed with exit code $LASTEXITCODE"
+}
 
 Write-Host "TraceGate v0.7 GCP full demo passed"
 Write-Host "endpoint=https://<redacted-external-ip>:8080"

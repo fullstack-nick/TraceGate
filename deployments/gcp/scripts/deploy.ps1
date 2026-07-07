@@ -4,6 +4,7 @@ param(
     [string] $VmName = "tracegate-vm",
     [string] $ImageTag = "",
     [switch] $AllowDirty,
+    [switch] $SkipBuild,
     [switch] $ReleaseQuality
 )
 
@@ -41,7 +42,12 @@ if (-not [string]::IsNullOrWhiteSpace($dirtyStatus)) {
     Write-Warning "deploying with a dirty worktree because an explicit override was provided"
 }
 
-& "$scriptRoot\build-image.ps1" -ImageTag $ImageTag
+if ($SkipBuild) {
+    Invoke-Checked { docker image inspect "tracegate:$ImageTag" | Out-Null } "inspect prebuilt image tracegate:$ImageTag"
+}
+else {
+    & "$scriptRoot\build-image.ps1" -ImageTag $ImageTag
+}
 
 $ip = (gcloud compute instances describe $VmName --zone $Zone --format="value(networkInterfaces[0].accessConfigs[0].natIP)").Trim()
 if ([string]::IsNullOrWhiteSpace($ip)) {

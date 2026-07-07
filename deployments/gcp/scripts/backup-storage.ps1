@@ -21,7 +21,7 @@ if ($OutputName -notmatch '^[A-Za-z0-9._-]+$') {
 $remotePath = "/opt/tracegate/data/backups/$OutputName"
 
 $remoteCommandTemplate = @'
-set -euxo pipefail
+set -euo pipefail
 sudo mkdir -p /opt/tracegate/data/backups
 sudo chown -R 10001:10001 /opt/tracegate/data
 docker exec tracegate-postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB"' | sudo tee __REMOTE_PATH__ >/dev/null
@@ -34,6 +34,12 @@ $encodedRemoteCommand = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes
 $remoteLauncher = "printf '%s' '$encodedRemoteCommand' | base64 -d | bash"
 
 gcloud compute ssh $VmName --zone $Zone --strict-host-key-checking=no --quiet --command $remoteLauncher
+if ($LASTEXITCODE -ne 0) {
+    throw "remote backup failed with exit code $LASTEXITCODE"
+}
 gcloud compute scp "${VmName}:${remotePath}" (Join-Path $scratch $OutputName) --zone $Zone --strict-host-key-checking=no --quiet
+if ($LASTEXITCODE -ne 0) {
+    throw "backup download failed with exit code $LASTEXITCODE"
+}
 
 Write-Host "Downloaded capture-store backup to $(Join-Path $scratch $OutputName)"

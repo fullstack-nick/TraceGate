@@ -793,6 +793,14 @@ Done when:
 - After all v1 development and verification is complete, the load generator VM is deleted, the app VM is resized back to `e2-micro`, and a final GCP inventory/billing hygiene proof shows no `n2-standard-16` or `n2-standard-8` TraceGate VMs remain.
 - v1.0 tag can be cut from the repository with repeatable commands.
 
+Implementation notes:
+
+- The 2026-07-07 release-quality run used `us-west1-a` as the proven fallback zone after GCP returned capacity exhaustion for the requested N2 release shapes in `us-central1`.
+- Cleanup must be allowed to target the fallback-zone app VM while sizing it back to `e2-micro`; the cleanup apply must set `release_quality_mode=false` and must still reject any remaining `n2-standard-16`, `n2-standard-8`, or load-generator VM.
+- Rollback proof must use a migration-compatible previous-good image. The `b188d88887bc` image is not a valid rollback boundary after migration `202607060001`; `f9b7d0ac3c80` was the validated previous-good rollback image for the v1.0 proof.
+- Stress proof accepts passive-health `503` for toxic capture paths under sustained failure load while normal live smoke still proves exact `500` and `200` behavior outside stress.
+- Final v1 proof is recorded in `proof/v1.0-release-quality.md`.
+
 ## Testing Strategy
 
 Test layers:

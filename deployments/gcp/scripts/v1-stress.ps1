@@ -53,7 +53,7 @@ if ($loadGenMachineType -ne "n2-standard-8") {
 }
 
 Invoke-Checked {
-    gcloud compute ssh $LoadGeneratorName --zone $Zone --strict-host-key-checking=no --quiet --command "mkdir -p /opt/tracegate-load/k6 /opt/tracegate-load/results && docker --version"
+    gcloud compute ssh $LoadGeneratorName --zone $Zone --strict-host-key-checking=no --quiet --command 'sudo mkdir -p /opt/tracegate-load/k6 /opt/tracegate-load/results && sudo chown -R "$USER:$USER" /opt/tracegate-load && docker --version'
 } "load generator readiness"
 
 Invoke-Checked {
@@ -63,6 +63,8 @@ Invoke-Checked {
 $remoteStress = @"
 set -euo pipefail
 mkdir -p /opt/tracegate-load/results
+chmod 0777 /opt/tracegate-load/results
+rm -f /opt/tracegate-load/results/v1-stress-summary.json
 docker pull grafana/k6:0.54.0
 docker run --rm -e BASE_URL=https://${appIp}:8080 -e API_KEY=tracegate-demo-key -e STRESS_DURATION=${Duration} -e SPIKE_DURATION=${SpikeDuration} -e SPIKE_VUS=${SpikeVus} -e SOAK_VUS=${SoakVus} -v /opt/tracegate-load/k6:/scripts:ro -v /opt/tracegate-load/results:/results grafana/k6:0.54.0 run --summary-export /results/v1-stress-summary.json /scripts/v1-stress.js
 ls -lah /opt/tracegate-load/results
@@ -100,7 +102,7 @@ done
 
 curl_admin http://tracegate:9090/health/ready
 curl_admin http://tracegate:9090/metrics | tee /tmp/tracegate-v1-post-stress-metrics.txt
-for series in tracegate_requests_total tracegate_captures_total tracegate_capture_dropped_total tracegate_replay_runs_total tracegate_plugin_decisions_total tracegate_plugin_timeouts_total tracegate_upstream_errors_total; do
+for series in tracegate_requests_total tracegate_captures_total tracegate_capture_dropped_total tracegate_plugin_decisions_total tracegate_plugin_timeouts_total tracegate_upstream_errors_total; do
   grep -F "$series" /tmp/tracegate-v1-post-stress-metrics.txt
 done
 

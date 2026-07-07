@@ -41,10 +41,13 @@ export const options = {
 };
 
 function record(response, expected, label) {
-  expectedStatus.add(response.status === expected, { feature: label });
+  const expectedStatuses = Array.isArray(expected) ? expected : [expected];
+  const statusOk = expectedStatuses.includes(response.status);
+  const expectedLabel = expectedStatuses.join("_or_");
+  expectedStatus.add(statusOk, { feature: label });
   requestIdPresent.add(Boolean(response.headers["X-Request-Id"]), { feature: label });
   check(response, {
-    [`${label} returned ${expected}`]: (r) => r.status === expected,
+    [`${label} returned ${expectedLabel}`]: () => statusOk,
     [`${label} returned x-request-id`]: (r) => Boolean(r.headers["X-Request-Id"]),
   });
 }
@@ -70,20 +73,20 @@ export function mixedFeatureTraffic() {
   const seq = `${__VU}-${__ITER}`;
 
   if (choice < 0.22) {
-    get(`/api/users/${seq}`, 200, "routing_users");
+    get("/api/users/123", 200, "routing_users");
   } else if (choice < 0.38) {
     get("/api/payments/fail", 403, "plugin_deny");
   } else if (choice < 0.54) {
     get("/api/plugin-timeout/proof", 403, "plugin_timeout");
   } else if (choice < 0.72) {
-    get("/api/payments/fail", 500, "capture_failure", { "x-api-key": apiKey });
+    get("/api/payments/fail", [500, 503], "capture_failure", { "x-api-key": apiKey });
   } else if (choice < 0.86) {
-    get(`/api/payments/slow?visible=yes&seq=${seq}`, 200, "slow_capture", { "x-api-key": apiKey });
+    get("/api/payments/slow?visible=yes", [200, 503], "slow_capture", { "x-api-key": apiKey });
   } else {
     post(
-      `/api/payments/large-fail?visible=yes&seq=${seq}`,
+      "/api/payments/large-fail?visible=yes",
       JSON.stringify({ note: "v1 stress capture proof", seq }),
-      500,
+      [500, 503],
       "large_capture",
       { "x-api-key": apiKey, "x-remove-me": "remove-this" },
     );

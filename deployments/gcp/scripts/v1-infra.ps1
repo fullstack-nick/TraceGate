@@ -30,6 +30,7 @@ function Invoke-TerraformApply {
     param(
         [string] $MachineType,
         [switch] $ReleaseQuality,
+        [switch] $AllowFallbackZone,
         [switch] $LoadGeneratorEnabled
     )
 
@@ -45,6 +46,9 @@ function Invoke-TerraformApply {
     }
     if ($ReleaseQuality) {
         $tfArgs.ReleaseQuality = $true
+    }
+    if ($AllowFallbackZone) {
+        $tfArgs.AllowFallbackZone = $true
     }
     if ($LoadGeneratorEnabled) {
         $tfArgs.LoadGeneratorEnabled = $true
@@ -105,15 +109,15 @@ switch ($Action) {
     "LoadGenUp" {
         Invoke-TerraformApply -MachineType "n2-standard-16" -ReleaseQuality -LoadGeneratorEnabled
         Invoke-Checked {
-            gcloud compute ssh $LoadGeneratorName --zone $Zone --strict-host-key-checking=no --quiet --command "docker --version && mkdir -p /opt/tracegate-load/k6 /opt/tracegate-load/results"
+            gcloud compute ssh $LoadGeneratorName --zone $Zone --strict-host-key-checking=no --quiet --command 'docker --version && sudo mkdir -p /opt/tracegate-load/k6 /opt/tracegate-load/results && sudo chown -R "$USER:$USER" /opt/tracegate-load'
         } "load generator provisioning check"
         Show-Inventory
     }
     "Cleanup" {
-        Invoke-TerraformApply -MachineType "e2-micro"
+        Invoke-TerraformApply -MachineType "e2-micro" -AllowFallbackZone
         Show-Inventory
         Assert-SteadyState
-        & "$scriptRoot\status.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName
+        & "$scriptRoot\status.ps1" -ProjectId $ProjectId -Zone $Zone -VmName $VmName -AllowFallbackZone
     }
     "Inventory" {
         & "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Region $Region -Zone $Zone -ReleaseQuality

@@ -19,7 +19,7 @@ if (-not [string]::IsNullOrWhiteSpace($RequestId)) {
 }
 
 $remoteCommandTemplate = @'
-set -euxo pipefail
+set -euo pipefail
 cd /opt/tracegate
 docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 ls -lah /opt/tracegate/data
@@ -37,3 +37,6 @@ $remoteCommand = $remoteCommandTemplate.Replace("__SHOW_COMMAND__", $showCommand
 $encodedRemoteCommand = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($remoteCommand))
 $remoteLauncher = "printf '%s' '$encodedRemoteCommand' | base64 -d | bash"
 gcloud compute ssh $VmName --zone $Zone --strict-host-key-checking=no --quiet --command $remoteLauncher
+if ($LASTEXITCODE -ne 0) {
+    throw "remote capture inspection failed with exit code $LASTEXITCODE"
+}

@@ -11,7 +11,7 @@ $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 & "$scriptRoot\guard.ps1" -ProjectId $ProjectId -Zone $Zone -ReleaseQuality:$ReleaseQuality
 
 $remoteCommand = @'
-set -euxo pipefail
+set -euo pipefail
 cd /opt/tracegate
 docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 request_id="__REQUEST_ID__"
@@ -30,3 +30,6 @@ $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($remo
 $launcher = "printf '%s' '$encodedCommand' | base64 -d | bash"
 
 gcloud compute ssh $VmName --zone $Zone --strict-host-key-checking=no --quiet --command "$launcher"
+if ($LASTEXITCODE -ne 0) {
+    throw "remote replay inspection failed with exit code $LASTEXITCODE"
+}
