@@ -17,11 +17,15 @@ if ([string]::IsNullOrWhiteSpace($ip)) {
 }
 $caPath = Join-Path $scratch "tracegate-ca.crt"
 gcloud compute scp "${VmName}:/opt/tracegate/tls/ca.crt" $caPath --zone $Zone
+$curlTlsArgs = @("--cacert", $caPath)
+if ((curl.exe -V) -match "Schannel") {
+    $curlTlsArgs += "--ssl-no-revoke"
+}
 
 function Invoke-Smoke($Path, $ExpectedStatus) {
     $url = "https://${ip}:8080$Path"
     $tmp = New-TemporaryFile
-    $status = (curl.exe -sS --cacert $caPath -o $tmp -w "%{http_code}" $url).Trim()
+    $status = (curl.exe -sS @curlTlsArgs -o $tmp -w "%{http_code}" $url).Trim()
     $body = Get-Content $tmp -Raw
     Remove-Item $tmp -Force
     Write-Host "$status $url"
@@ -34,7 +38,7 @@ function Invoke-Smoke($Path, $ExpectedStatus) {
 function Invoke-KeyedSmoke($Path, $ExpectedStatus) {
     $url = "https://${ip}:8080$Path"
     $tmp = New-TemporaryFile
-    $status = (curl.exe -sS --cacert $caPath -o $tmp -w "%{http_code}" -H "x-api-key: tracegate-demo-key" $url).Trim()
+    $status = (curl.exe -sS @curlTlsArgs -o $tmp -w "%{http_code}" -H "x-api-key: tracegate-demo-key" $url).Trim()
     $body = Get-Content $tmp -Raw
     Remove-Item $tmp -Force
     Write-Host "$status $url"
@@ -47,7 +51,7 @@ function Invoke-KeyedSmoke($Path, $ExpectedStatus) {
 function Invoke-PostSmoke($Path, $ExpectedStatus, $Body) {
     $url = "https://${ip}:8080$Path"
     $tmp = New-TemporaryFile
-    $status = (curl.exe -sS --cacert $caPath -o $tmp -w "%{http_code}" -X POST -H "content-type: application/json" -H "authorization: Bearer should-not-be-stored" -H "x-api-key: tracegate-demo-key" --data $Body $url).Trim()
+    $status = (curl.exe -sS @curlTlsArgs -o $tmp -w "%{http_code}" -X POST -H "content-type: application/json" -H "authorization: Bearer should-not-be-stored" -H "x-api-key: tracegate-demo-key" --data $Body $url).Trim()
     $body = Get-Content $tmp -Raw
     Remove-Item $tmp -Force
     Write-Host "$status POST $url"

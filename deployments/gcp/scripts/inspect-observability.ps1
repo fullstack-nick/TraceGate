@@ -27,4 +27,6 @@ docker run --rm --network tracegate_default curlimages/curl:8.10.1 -fsS 'http://
 docker run --rm --network tracegate_default curlimages/curl:8.10.1 -fsS 'http://jaeger:16686/api/traces?service=tracegate&limit=5'
 '@
 
-gcloud compute ssh $VmName --zone $Zone --command $remoteCommand
+$encodedRemoteCommand = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($remoteCommand))
+$remoteLauncher = "printf '%s' '$encodedRemoteCommand' | base64 -d | bash"
+gcloud compute ssh $VmName --zone $Zone --strict-host-key-checking=no --quiet --command $remoteLauncher

@@ -1470,12 +1470,8 @@ impl CaptureWriter {
     fn enqueue(&self, write: CaptureWrite, telemetry: &Telemetry) {
         match self.sender.try_send(write) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(mut returned)) => {
-                let had_capture = returned.capture.take().is_some();
-                returned.record.capture_dropped = true;
-                if had_capture {
-                    telemetry.record_capture_dropped();
-                }
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                let returned = metadata_only_capture_fallback(returned, telemetry);
                 tracing::warn!("capture writer queue full; recording metadata-only fallback");
                 if let Err(err) = self.sender.try_send(returned) {
                     tracing::warn!(error = %err, "failed to enqueue metadata-only capture fallback");
@@ -1488,6 +1484,15 @@ impl CaptureWriter {
             }
         }
     }
+}
+
+fn metadata_only_capture_fallback(mut write: CaptureWrite, telemetry: &Telemetry) -> CaptureWrite {
+    let had_capture = write.capture.take().is_some();
+    write.record.capture_dropped = true;
+    if had_capture {
+        telemetry.record_capture_dropped();
+    }
+    write
 }
 
 struct CaptureBuffer {
@@ -2064,5 +2069,59 @@ mod tests {
         ] {
             assert!(value.get(field).is_some(), "missing field {field}");
         }
+    }
+
+    #[test]
+    fn capture_queue_full_fallback_is_metadata_only() {
+        let telemetry = Telemetry::new(&tracegate_core::ObservabilityConfig {
+            service_name: "tracegate-test".to_owned(),
+            environment: "test".to_owned(),
+            otlp_endpoint: None,
+            prometheus_enabled: true,
+            json_logs: true,
+        });
+        let write = CaptureWrite {
+            record: RequestInsert {
+                request_id: "req".to_owned(),
+                trace_id: None,
+                route_id: Some("payments".to_owned()),
+                method: "POST".to_owned(),
+                path: "/api/payments/fail".to_owned(),
+                redacted_query: None,
+                query_hash: None,
+                status: 500,
+                latency_ms: 12,
+                upstream: Some("https://payments-service:4443".to_owned()),
+                is_error: true,
+                is_slow: false,
+                capture_policy: CapturePolicy::Errors.to_string(),
+                capture_dropped: false,
+                created_at_ms: 1,
+            },
+            request_headers: Vec::new(),
+            response_headers: Vec::new(),
+            capture: Some(CaptureInsert {
+                request_content_type: Some("application/json".to_owned()),
+                response_content_type: Some("application/json".to_owned()),
+                request_body: Some(b"request".to_vec()),
+                response_body: Some(b"response".to_vec()),
+                request_body_truncated: false,
+                response_body_truncated: false,
+                request_body_sha256: Some("request-sha".to_owned()),
+                response_body_sha256: Some("response-sha".to_owned()),
+            }),
+            plugin_decisions: Vec::new(),
+        };
+
+        let fallback = metadata_only_capture_fallback(write, &telemetry);
+
+        assert!(fallback.record.capture_dropped);
+        assert!(fallback.capture.is_none());
+        assert!(
+            telemetry
+                .render_prometheus()
+                .unwrap()
+                .contains("tracegate_capture_dropped_total")
+        );
     }
 }
